@@ -20,7 +20,7 @@ use iroh_gossip::{
     api::{GossipReceiver, GossipSender},
     net::Gossip,
 };
-use iroh_topic_tracker::{TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle};
+use iroh_topic_tracker::{TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle, TopicDiscoveryHook};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -30,6 +30,7 @@ use actor_helper::{Action, Actor, Handle, act, act_ok};
 
 #[derive(Debug, Clone)]
 pub struct Builder {
+    topic_discovery_hook: TopicDiscoveryHook,
     entry_name: String,
     secret_key: SecretKey,
     password: String,
@@ -40,8 +41,17 @@ pub struct Builder {
 }
 
 impl Builder {
-    pub fn new() -> Builder {
-        Builder::default()
+    pub fn new(topic_discovery_hook: TopicDiscoveryHook) -> Builder {
+        Builder {
+            topic_discovery_hook,
+            entry_name: String::default(),
+            secret_key: SecretKey::generate(&mut rand::rng()),
+            password: String::default(),
+            endpoint: None,
+            gossip: None,
+            docs: None,
+            blobs: MemStore::new(),
+        }
     }
 
     pub fn entry_name(mut self, entry_name: &str) -> Self {
@@ -108,13 +118,12 @@ impl Builder {
         let topic_hash: [u8; 32] = topic_hasher.finalize()[..32].try_into()?;
 
         let signing_key = SigningKey::from_bytes(&self.secret_key.to_bytes());
-        let topic_discovery_config = TopicDiscoveryConfig::new(signing_key);
+        let topic_discovery_config = TopicDiscoveryConfig::new(signing_key, self.topic_discovery_hook.clone());
         let (gossip_sender, gossip_receiver, topic_handle) = loop {
             if let Ok((gossip_sender, gossip_receiver, topic_handle)) = gossip
             .subscribe_with_discovery_joined(
                 topic_hash.to_vec(),
                 vec![],
-                endpoint.clone(),
                 topic_discovery_config.clone(),
             )
             .await {
@@ -177,20 +186,6 @@ impl Builder {
     }
 }
 
-impl Default for Builder {
-    fn default() -> Self {
-        Self {
-            entry_name: String::default(),
-            secret_key: SecretKey::generate(&mut rand::rng()),
-            password: String::default(),
-            endpoint: None,
-            gossip: None,
-            docs: None,
-            blobs: MemStore::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Router {
     api: Handle<RouterActor, anyhow::Error>,
@@ -226,8 +221,8 @@ struct RouterActor {
 }
 
 impl Router {
-    pub fn builder() -> Builder {
-        Builder::new()
+    pub fn builder(topic_discovery_hook: TopicDiscoveryHook) -> Builder {
+        Builder::new(topic_discovery_hook)
     }
 
     pub async fn get_ip_state(&self) -> Result<RouterIp> {

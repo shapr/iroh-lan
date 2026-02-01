@@ -6,9 +6,11 @@ use std::{
 use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
 use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh_auth::Authenticator;
 use iroh_blobs::store::mem::MemStore;
 use iroh_docs::protocol::Docs;
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
+use iroh_topic_tracker::TopicDiscoveryHook;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
 
@@ -28,6 +30,7 @@ struct NetworkActor {
 
     router: Router,
     direct: Direct,
+    _auth: Authenticator,
 
     _iroh_router: iroh::protocol::Router,
     _iroh_endpoint: iroh::endpoint::Endpoint,
@@ -49,10 +52,21 @@ impl Network {
     pub async fn new(name: &str, password: &str) -> Result<Self> {
         let secret_key = SecretKey::generate(&mut rand::rng());
 
+        let mut network_secret = sha2::Sha512::new();
+        network_secret.update(format!("iroh-lan-network-name-{}", name));
+        network_secret.update(format!("iroh-lan-network-secret-{password}"));
+        let network_secret: [u8; 64] = network_secret.finalize().into();
+
+        let auth = Authenticator::new(&network_secret);
+        let topic_discovery_hook = TopicDiscoveryHook::new();
         let endpoint = Endpoint::builder()
+            .hooks(auth.clone())
+            .hooks(topic_discovery_hook.clone())
             .secret_key(secret_key.clone())
             .bind()
             .await?;
+        auth.set_endpoint(&endpoint);
+
 
         let gossip_config = HyparviewConfig {
             neighbor_request_timeout: Duration::from_millis(2000),
@@ -68,15 +82,12 @@ impl Network {
             .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
             .await?;
 
-        let mut network_secret = sha2::Sha512::new();
-        network_secret.update(format!("iroh-lan-network-name-{}", name));
-        network_secret.update(format!("iroh-lan-network-secret-{password}"));
-        let network_secret: [u8; 64] = network_secret.finalize().into();
 
         let (direct_connect_tx, direct_connect_rx) = tokio::sync::mpsc::channel(1024 * 16);
         let direct = Direct::new(endpoint.clone(), direct_connect_tx.clone(), &network_secret);
 
         let _router = iroh::protocol::Router::builder(endpoint.clone())
+            .accept(iroh_auth::ALPN, auth.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(crate::Direct::ALPN, direct.clone())
             .accept(iroh_docs::ALPN, docs.clone())
@@ -86,7 +97,7 @@ impl Network {
             )
             .spawn();
 
-        let router = crate::Router::builder()
+        let router = crate::Router::builder(topic_discovery_hook)
             .entry_name(name)
             .password(password)
             .secret_key(secret_key)
@@ -106,6 +117,7 @@ impl Network {
                 rx,
                 router,
                 direct,
+                _auth: auth,
 
                 _iroh_router: _router,
                 _iroh_endpoint: endpoint,
