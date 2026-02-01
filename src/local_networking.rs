@@ -104,6 +104,14 @@ impl Tun {
     }
 
     pub async fn write(&self, pkg: Ipv4Pkg) -> Result<()> {
+        let cap = self.tun_tx.capacity();
+        if cap < 1000 {
+            warn!(
+                "TunActor write channel saturated ({} free). Packet flow stalled.",
+                cap
+            );
+        }
+
         match self.tun_tx.send(pkg).await {
             Ok(_) => Ok(()),
             Err(e) => Err(anyhow::anyhow!("Tun actor closed: {}", e)),

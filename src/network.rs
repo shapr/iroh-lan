@@ -37,6 +37,8 @@ struct NetworkActor {
 
     tun: Option<Tun>,
 
+    tun_ip_debug: Option<std::net::Ipv4Addr>,
+
     _local_to_direct_tx: tokio::sync::mpsc::Sender<Ipv4Pkg>,
     local_to_direct_rx: tokio::sync::mpsc::Receiver<Ipv4Pkg>,
 
@@ -67,7 +69,6 @@ impl Network {
             .await?;
         auth.set_endpoint(&endpoint);
 
-
         let gossip_config = HyparviewConfig {
             neighbor_request_timeout: Duration::from_millis(2000),
             ..Default::default()
@@ -81,7 +82,6 @@ impl Network {
         let docs = Docs::memory()
             .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
             .await?;
-
 
         let (direct_connect_tx, direct_connect_rx) = tokio::sync::mpsc::channel(1024 * 16);
         let direct = Direct::new(endpoint.clone(), direct_connect_tx.clone(), &network_secret);
@@ -123,6 +123,7 @@ impl Network {
                 _iroh_endpoint: endpoint,
 
                 tun: None,
+                tun_ip_debug: None,
                 _local_to_direct_tx: to_remote_writer,
                 local_to_direct_rx: to_remote_reader,
                 _direct_to_local_tx: direct_connect_tx,
@@ -202,6 +203,11 @@ impl Actor<anyhow::Error> for NetworkActor {
 
                 // init tun after ip is assigned
                 _ = ip_tick.tick() => {
+                    if let Some(tun_ip) = self.tun_ip_debug
+                        && let Ok(RouterIp::AssignedIp(router_ip)) = self.router.get_ip_state().await
+                        && tun_ip != router_ip {
+                            error!("IP Configuration Mismatch: TUN={}, Router={}. Connectivity compromised.", tun_ip, router_ip);
+                        }
                     if self.tun.is_none() {
                         match self.router.get_ip_state().await {
                             Ok(RouterIp::AssignedIp(ip)) => {
@@ -212,6 +218,7 @@ impl Actor<anyhow::Error> for NetworkActor {
                                 ).await {
                                     Ok(Ok(tun)) => {
                                         info!("TUN initialized successfully");
+                                        self.tun_ip_debug = Some(ip);
                                         self.tun = Some(tun);
                                         if let Ok(peers) = self.router.get_peers().await {
                                             for (id, _) in peers {

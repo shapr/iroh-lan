@@ -258,6 +258,10 @@ impl Actor<anyhow::Error> for ConnActor {
                     }
                 }
                 _ = stats_ticker.tick() => {
+                    let q_len = self.queue_len.load(std::sync::atomic::Ordering::Relaxed);
+                    if q_len > 100 {
+                        warn!("[PROBE-QUEUE] High Queue Len: {}", q_len);
+                    }
                     debug!(
                         "Conn stats: state={:?} last_rx={:?} last_tx={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
                         self.state,

@@ -20,7 +20,9 @@ use iroh_gossip::{
     api::{GossipReceiver, GossipSender},
     net::Gossip,
 };
-use iroh_topic_tracker::{TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle, TopicDiscoveryHook};
+use iroh_topic_tracker::{
+    TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle, TopicDiscoveryHook,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -118,15 +120,17 @@ impl Builder {
         let topic_hash: [u8; 32] = topic_hasher.finalize()[..32].try_into()?;
 
         let signing_key = SigningKey::from_bytes(&self.secret_key.to_bytes());
-        let topic_discovery_config = TopicDiscoveryConfig::new(signing_key, self.topic_discovery_hook.clone());
+        let topic_discovery_config =
+            TopicDiscoveryConfig::new(signing_key, self.topic_discovery_hook.clone());
         let (gossip_sender, gossip_receiver, topic_handle) = loop {
             if let Ok((gossip_sender, gossip_receiver, topic_handle)) = gossip
-            .subscribe_with_discovery_joined(
-                topic_hash.to_vec(),
-                vec![],
-                topic_discovery_config.clone(),
-            )
-            .await {
+                .subscribe_with_discovery_joined(
+                    topic_hash.to_vec(),
+                    vec![],
+                    topic_discovery_config.clone(),
+                )
+                .await
+            {
                 break (gossip_sender, gossip_receiver, Some(topic_handle));
             } else {
                 warn!("Failed to join topic; retrying in 2 second");
@@ -167,7 +171,7 @@ impl Builder {
         tokio::spawn(async move {
             let mut router_actor = RouterActor {
                 _gossip_sender: gossip_sender,
-                _gossip_receiver: gossip_receiver,
+                gossip_monitor: gossip_receiver,
                 author_id,
                 _docs: docs,
                 doc,
@@ -204,7 +208,7 @@ struct RouterActor {
     pub(crate) rx: actor_helper::Receiver<Action<RouterActor>>,
 
     pub _gossip_sender: GossipSender,
-    pub _gossip_receiver: GossipReceiver,
+    pub gossip_monitor: GossipReceiver,
 
     pub(crate) blobs: MemStore,
     pub(crate) _docs: Docs,
@@ -303,6 +307,17 @@ impl Actor<anyhow::Error> for RouterActor {
                 _ = tokio::signal::ctrl_c() => {
                     info!("Received Ctrl-C, stopping RouterActor");
                     break
+                }
+
+                Some(event) = self.gossip_monitor.next() => {
+                    match event {
+                        Ok(e) => {
+                            if rand::rng().random_bool(0.1) {
+                                warn!("Gossip monitor: Unhandled event (potential backpressure source): {:?}", e);
+                            }
+                        }
+                        Err(e) => warn!("Gossip monitor stream error: {:?}", e),
+                    }
                 }
 
                 // advance ip state machine
@@ -420,7 +435,6 @@ impl RouterActor {
     const ASSIGNMENT_STALE_SECS: u64 = 300;
     const CANDIDATE_STALE_SECS: u64 = 60;
 
-
     async fn read_all_ip_assignments(&mut self) -> Result<Vec<IpAssignment>> {
         trace!("Reading all IP assignments");
         if let Some(cached) = self.assignments_cache.get(Self::DOC_READ_MIN_INTERVAL) {
@@ -433,7 +447,14 @@ impl RouterActor {
             .collect::<Vec<_>>()
             .await
             .iter()
-            .filter_map(|entry| { if let Ok(entry) = entry.as_ref() {  Some(entry) } else { warn!("[PEER] entry is not ok!"); None } })
+            .filter_map(|entry| {
+                if let Ok(entry) = entry.as_ref() {
+                    Some(entry)
+                } else {
+                    warn!("[PEER] entry is not ok!");
+                    None
+                }
+            })
             .cloned()
             .collect::<Vec<_>>();
 
@@ -476,7 +497,6 @@ impl RouterActor {
         Ok(candidates)
     }
 
-
     async fn clear_ip_candidate(&mut self, ip: Ipv4Addr, endpoint_id: EndpointId) -> Result<()> {
         debug!("Clearing IP candidate {} for {}", ip, endpoint_id);
         self.doc
@@ -502,7 +522,9 @@ impl RouterActor {
         let filtered = candidates
             .into_iter()
             .filter(|candidate| candidate.ip == ip)
-            .filter(|candidate| now.saturating_sub(candidate.last_updated) <= Self::CANDIDATE_STALE_SECS)
+            .filter(|candidate| {
+                now.saturating_sub(candidate.last_updated) <= Self::CANDIDATE_STALE_SECS
+            })
             .collect::<Vec<_>>();
         debug!("candidates for {ip}: {}", filtered.len());
         Ok(filtered)
@@ -771,9 +793,17 @@ impl RouterActor {
         // Cleanup assignments
         for a in self.read_all_ip_assignments().await? {
             if now.saturating_sub(a.last_updated) > Self::ASSIGNMENT_STALE_SECS {
+                /*if a.endpoint_id == self.endpoint_id {
+                    error!(
+                        "Self-eviction: Expiring own IP assignment for {} (Age: {}s)",
+                        a.ip,
+                        now - a.last_updated
+                    );
+                }*/
                 info!(
-                    "Removing stale IP assignment for {} (last updated {}s ago)",
+                    "Removing stale IP assignment for {} (Endpoint: {}, Age: {}s)",
                     a.ip,
+                    a.endpoint_id,
                     now - a.last_updated
                 );
                 if let Err(e) = self.doc.del(self.author_id, key_ip_assigned(a.ip)).await {

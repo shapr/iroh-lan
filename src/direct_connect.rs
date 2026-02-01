@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::timeout;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{Router, RouterIp, auth, connection::Conn, local_networking::Ipv4Pkg};
 
@@ -166,10 +166,10 @@ impl DirectActor {
 
         if let Some(conn_ref) = self.peers.get(&remote_id) {
             let state = conn_ref.get_state().await;
-            if state == crate::connection::ConnState::Open && !prefer_incoming {
-                info!(
-                    "Ignoring incoming connection from {} (keeping existing connection)",
-                    remote_id
+            if state != crate::connection::ConnState::Disconnected && !prefer_incoming {
+                warn!(
+                    "Race Condition: Rejecting incoming connection from {} (Existing state: {:?}, Prefer Incoming: {})",
+                    remote_id, state, prefer_incoming
                 );
                 conn.close(VarInt::from_u32(409), b"duplicate connection");
                 return Ok(());
@@ -189,7 +189,9 @@ impl DirectActor {
 
             match accept_result {
                 Ok(Ok((send, recv))) => {
-                    let _ = api.call(act!(actor => actor.finalize_connection(conn, send, recv))).await;
+                    let _ = api
+                        .call(act!(actor => actor.finalize_connection(conn, send, recv)))
+                        .await;
                 }
                 Ok(Err(e)) => {
                     error!("Auth accept failed from {}: {}", remote_id, e);
@@ -228,11 +230,7 @@ impl DirectActor {
                         remote_id
                     );
 
-                    if let Err(e) = entry
-                        .get_mut()
-                        .incoming_connection(conn, send, recv)
-                        .await
-                    {
+                    if let Err(e) = entry.get_mut().incoming_connection(conn, send, recv).await {
                         error!("Failed to upgrade connection to {}: {}", remote_id, e);
                     }
                 } else {
