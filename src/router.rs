@@ -370,7 +370,7 @@ pub struct IpCandidate {
 }
 
 async fn entry_to_value<S: for<'a> Deserialize<'a>>(
-    blobs: MemStore,
+    blobs: &MemStore,
     entry: &Entry,
 ) -> anyhow::Result<S> {
     let b = blobs.get_bytes(entry.content_hash()).await?;
@@ -460,11 +460,11 @@ impl RouterActor {
 
         let mut assignments = Vec::new();
         for entry in entries {
-            match entry_to_value::<IpAssignment>(self.blobs.clone(), &entry).await {
+            match entry_to_value::<IpAssignment>(&self.blobs, &entry).await {
                 Ok(assignment) => assignments.push(assignment),
                 Err(e) => {
                     warn!(
-                        "Pending blob sync for assignment: {}. Entry: {:?}",
+                        "Pending blob sync for assignment: {:?}. Entry: {:?}",
                         e,
                         entry.content_hash()
                     );
@@ -494,24 +494,14 @@ impl RouterActor {
 
         let mut candidates = Vec::new();
         for entry in entries {
-            match entry_to_value::<IpCandidate>(self.blobs.clone(), &entry).await {
+            match entry_to_value::<IpCandidate>(&self.blobs, &entry).await {
                 Ok(candidate) => candidates.push(candidate),
                 Err(e) => {
                     warn!(
-                        "Failed to read candidate blob (blob missing?): {}. Entry: {:?}",
+                        "Pending blob sync for candidate: {:?}. Entry: {:?}",
                         e,
                         entry.content_hash()
                     );
-                    match self.candidates_cache.get(Duration::MAX) {
-                        Some(cached) => return Ok(cached.to_vec()),
-                        None => {
-                            warn!(
-                                "Pending blob sync for assignment: {}. Entry: {:?}",
-                                e,
-                                entry.content_hash()
-                            );
-                        }
-                    }
                 }
             }
         }
