@@ -7,10 +7,13 @@ use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_auth::Authenticator;
-use iroh_blobs::store::{
+use iroh_blobs::{
+    BlobsProtocol,
+    store::{
         GcConfig,
         mem::{MemStore, Options},
-    };
+    },
+};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
 use iroh_topic_tracker::TopicDiscoveryHook;
@@ -99,7 +102,7 @@ impl Network {
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(crate::Direct::ALPN, direct.clone())
             .accept(iroh_docs::ALPN, docs.clone())
-            .accept(iroh_blobs::ALPN, blobs.clone())
+            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
             .spawn();
 
         let router = crate::Router::builder(topic_discovery_hook)

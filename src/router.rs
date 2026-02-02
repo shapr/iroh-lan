@@ -34,7 +34,7 @@ pub struct Builder {
     endpoint: Option<Endpoint>,
     gossip: Option<Gossip>,
     docs: Option<Docs>,
-    blobs: BlobsProtocol,
+    blobs: MemStore,
 }
 
 impl Builder {
@@ -47,7 +47,7 @@ impl Builder {
             endpoint: None,
             gossip: None,
             docs: None,
-            blobs: BlobsProtocol::new(&MemStore::new(), None),
+            blobs: MemStore::new(),
         }
     }
 
@@ -81,7 +81,7 @@ impl Builder {
         self
     }
 
-    pub fn blobs(mut self, blobs: BlobsProtocol) -> Self {
+    pub fn blobs(mut self, blobs: MemStore) -> Self {
         self.blobs = blobs;
         self
     }
@@ -205,7 +205,7 @@ struct RouterActor {
     pub _gossip_sender: GossipSender,
     pub gossip_monitor: GossipReceiver,
 
-    pub(crate) blobs: BlobsProtocol,
+    pub(crate) blobs: MemStore,
     pub(crate) _docs: Docs,
     pub(crate) doc: Doc,
     pub(crate) author_id: AuthorId,
