@@ -55,7 +55,7 @@ pub async fn run_cli() -> Result<()> {
         use tracing_subscriber::{EnvFilter, fmt, prelude::*};
         tracing_subscriber::registry()
             .with(fmt::layer().with_thread_ids(true))
-            .with(EnvFilter::new("iroh_lan=debug"))
+            .with(EnvFilter::new("iroh_lan=debug,iroh_auth=debug"))
             .init();
     }
 

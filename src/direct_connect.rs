@@ -6,14 +6,10 @@ use iroh::{
     protocol::ProtocolHandler,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    time::Duration,
-};
-use tokio::time::timeout;
+use std::collections::{HashMap, hash_map::Entry};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::{Router, RouterIp, auth, connection::Conn, local_networking::Ipv4Pkg};
+use crate::{Router, RouterIp, connection::Conn, local_networking::Ipv4Pkg};
 
 #[derive(Debug, Clone)]
 pub struct Direct {
@@ -23,7 +19,6 @@ pub struct Direct {
 #[derive(Debug)]
 struct DirectActor {
     self_handle: Handle<DirectActor, anyhow::Error>,
-    network_secret: [u8; 64],
     peers: HashMap<EndpointId, Conn>,
     endpoint: iroh::endpoint::Endpoint,
     rx: actor_helper::Receiver<Action<DirectActor>>,
@@ -38,11 +33,10 @@ pub enum DirectMessage {
 }
 
 impl Direct {
-    pub const ALPN: &[u8] = b"/iroh/lan-direct/1.0.1";
+    pub const ALPN: &[u8] = b"/iroh/lan-direct/1.0.2";
     pub fn new(
         endpoint: iroh::endpoint::Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
-        network_secret: &[u8; 64],
     ) -> Self {
         let (api, rx) = Handle::channel();
         let mut actor = DirectActor {
@@ -51,7 +45,6 @@ impl Direct {
             endpoint,
             rx,
             direct_connect_tx,
-            network_secret: *network_secret,
             router: None,
         };
         tokio::spawn(async move { actor.run().await });
@@ -176,29 +169,20 @@ impl DirectActor {
             }
         }
 
-        let network_secret = self.network_secret;
-        let my_id = self.endpoint.id();
         let api = self.self_handle.clone();
 
         tokio::spawn(async move {
-            let accept_result = timeout(
-                Duration::from_secs(60),
-                auth::accept(&conn, &network_secret, my_id, remote_id),
-            )
-            .await;
+            let accept_result = conn.accept_bi().await;
 
             match accept_result {
-                Ok(Ok((send, recv))) => {
+                Ok((send, recv)) => {
                     let _ = api
                         .call(act!(actor => actor.finalize_connection(conn, send, recv)))
                         .await;
                 }
-                Ok(Err(e)) => {
-                    error!("Auth accept failed from {}: {}", remote_id, e);
-                }
-                Err(_) => {
-                    error!("Auth accept timed out from {}", remote_id);
-                    conn.close(VarInt::from_u32(408), b"accept timeout");
+                Err(e) => {
+                    error!("Stream accept failed from {}: {}", remote_id, e);
+                    conn.close(VarInt::from_u32(408), b"accept failed");
                 }
             }
         });
@@ -249,7 +233,6 @@ impl DirectActor {
                     send,
                     recv,
                     self.direct_connect_tx.clone(),
-                    &self.network_secret,
                 )
                 .await
                 {
@@ -276,13 +259,8 @@ impl DirectActor {
             }
             Entry::Vacant(entry) => {
                 info!("No active connection to {}, initiating new connection", to);
-                let conn = Conn::connect(
-                    self.endpoint.clone(),
-                    to,
-                    self.direct_connect_tx.clone(),
-                    &self.network_secret,
-                )
-                .await;
+                let conn =
+                    Conn::connect(self.endpoint.clone(), to, self.direct_connect_tx.clone()).await;
 
                 if let Err(e) = conn.write(pkg).await {
                     error!("Failed to write packet to new connection {}: {}", to, e);
@@ -299,14 +277,11 @@ impl DirectActor {
         if self.peers.contains_key(&to) {
             return Ok(());
         }
-        info!("No active connection to {}, initiating new connection (ensure_connection)", to);
-        let conn = Conn::connect(
-            self.endpoint.clone(),
-            to,
-            self.direct_connect_tx.clone(),
-            &self.network_secret,
-        )
-        .await;
+        info!(
+            "No active connection to {}, initiating new connection (ensure_connection)",
+            to
+        );
+        let conn = Conn::connect(self.endpoint.clone(), to, self.direct_connect_tx.clone()).await;
         self.peers.insert(to, conn);
         Ok(())
     }

@@ -1,4 +1,3 @@
-pub mod auth;
 mod connection;
 mod direct_connect;
 mod local_networking;

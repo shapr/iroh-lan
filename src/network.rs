@@ -84,7 +84,7 @@ impl Network {
             .await?;
 
         let (direct_connect_tx, direct_connect_rx) = tokio::sync::mpsc::channel(1024 * 16);
-        let direct = Direct::new(endpoint.clone(), direct_connect_tx.clone(), &network_secret);
+        let direct = Direct::new(endpoint.clone(), direct_connect_tx.clone());
 
         let _router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(iroh_auth::ALPN, auth.clone())

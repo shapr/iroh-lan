@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
 
-use crate::{DirectMessage, auth};
+use crate::DirectMessage;
 use actor_helper::{Action, Actor, Handle, Receiver, act, act_ok};
 use anyhow::Result;
 use iroh::endpoint::{Connection, VarInt};
@@ -52,7 +52,6 @@ struct ConnActor {
     conn: Option<Connection>,
     conn_endpoint_id: EndpointId,
     endpoint: Endpoint,
-    network_secret: [u8; 64],
 
     last_reconnect: tokio::time::Instant,
     reconnect_backoff: Duration,
@@ -85,7 +84,6 @@ impl Conn {
         send_stream: SendStream,
         recv_stream: RecvStream,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
-        network_secret: &[u8; 64],
     ) -> Result<Self> {
         let (api, rx) = Handle::channel();
         let mut actor = ConnActor::new(
@@ -97,7 +95,6 @@ impl Conn {
             Some(conn),
             Some(send_stream),
             Some(recv_stream),
-            network_secret,
         )
         .await;
         tokio::spawn(async move { actor.run().await });
@@ -108,7 +105,6 @@ impl Conn {
         endpoint: Endpoint,
         endpoint_id: EndpointId,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
-        network_secret: &[u8; 64],
     ) -> Self {
         let (api, rx) = Handle::channel();
         let mut actor = ConnActor::new(
@@ -120,7 +116,6 @@ impl Conn {
             None,
             None,
             None,
-            network_secret,
         )
         .await;
 
@@ -132,25 +127,22 @@ impl Conn {
 
         tokio::spawn({
             let s = s.clone();
-            let network_secret = *network_secret;
             async move {
                 match endpoint.connect(endpoint_id, crate::Direct::ALPN).await {
-                    Ok(conn) => {
-                        match auth::open(&conn, &network_secret, endpoint.id(), endpoint_id).await {
-                            Ok((send, recv)) => {
-                                let _ = s.incoming_connection(conn, send, recv).await;
-                            }
-                            Err(e) => {
-                                warn!("Auth failed during initial connection: {}", e);
-                                let _ = s
+                    Ok(conn) => match conn.open_bi().await {
+                        Ok((send, recv)) => {
+                            let _ = s.incoming_connection(conn, send, recv).await;
+                        }
+                        Err(e) => {
+                            warn!("Failed to open bi-stream during initial connection: {}", e);
+                            let _ = s
                                     .api
                                     .call(
                                         act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
                                     )
                                     .await;
-                            }
                         }
-                    }
+                    },
                     Err(e) => {
                         warn!("Initial connection failed: {}", e);
                         let _ = s
@@ -297,7 +289,6 @@ impl ConnActor {
         conn: Option<iroh::endpoint::Connection>,
         send_stream: Option<SendStream>,
         mut recv_stream: Option<RecvStream>,
-        network_secret: &[u8; 64],
     ) -> Self {
         let mut read_task = None;
         if let Some(recv) = recv_stream.take() {
@@ -342,7 +333,6 @@ impl ConnActor {
             sender_queue: VecDeque::with_capacity(QUEUE_SIZE),
             conn,
             endpoint,
-            network_secret: *network_secret,
             last_reconnect: tokio::time::Instant::now(),
             reconnect_backoff: Duration::from_millis(100),
             conn_endpoint_id,
@@ -557,12 +547,11 @@ impl ConnActor {
             let api = self.self_handle.clone();
             let endpoint = self.endpoint.clone();
             let conn_node_id = self.conn_endpoint_id;
-            let network_secret = self.network_secret;
             async move {
                 debug!("Initiating reconnection to {}", conn_node_id);
                 if let Ok(conn) = endpoint.connect(conn_node_id, crate::Direct::ALPN).await {
                     debug!("Reconnection successful");
-                    match auth::open(&conn, &network_secret, endpoint.id(), conn_node_id).await {
+                    match conn.open_bi().await {
                         Ok((send, recv)) => {
                             let _ = api
                                 .call(act!(actor => actor.incoming_connection(conn, send, recv)))
@@ -673,7 +662,9 @@ async fn retry_read_loop(
             }
             Err(e) => {
                 warn!("Stream read error: {}", e);
-                let _ = api.call(act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) })).await;
+                let _ = api
+                    .call(act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }))
+                    .await;
                 break;
             }
         }
