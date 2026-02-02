@@ -251,13 +251,27 @@ impl Actor<anyhow::Error> for NetworkActor {
                 _ = cache_tick.tick() => {
                     if let Ok(peers) = self.router.get_peers().await {
                         let mut next_peer_ids = HashSet::new();
-                        self.ip_cache.clear();
+                        let mut router_peers: HashMap<std::net::Ipv4Addr, EndpointId> = HashMap::new();
+
                         for (id, maybe_ip) in peers {
                             next_peer_ids.insert(id);
                             if let Some(ip) = maybe_ip {
-                                self.ip_cache.insert(ip, id);
+                                router_peers.insert(ip, id);
                             }
                         }
+
+                        let cached_ips: Vec<_> = self.ip_cache.keys().copied().collect();
+                        for ip in cached_ips {
+                            if let std::collections::hash_map::Entry::Vacant(e) = router_peers.entry(ip)
+                                && let Some(owner_id) = self.ip_cache.get(&ip)
+                                    && let Ok(crate::connection::ConnState::Open) = self.direct.get_conn_state(*owner_id).await {
+                                        debug!("[Data-Plane Liveness] Preserving route to {} (owned by {}) despite Router/Doc miss. Connection is OPEN.", ip, owner_id);
+                                        e.insert(*owner_id);
+                                        next_peer_ids.insert(*owner_id);
+                                    }
+                        }
+
+                        self.ip_cache = router_peers;
                         if !self.pending_packets.is_empty() {
                             let now = Instant::now();
                             let pending_keys: Vec<_> = self.pending_packets.keys().copied().collect();

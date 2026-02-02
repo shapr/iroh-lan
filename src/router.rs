@@ -464,17 +464,10 @@ impl RouterActor {
                 Ok(assignment) => assignments.push(assignment),
                 Err(e) => {
                     warn!(
-                        "Failed to read assignment blob (blob missing?): {}. Entry: {:?}",
+                        "Pending blob sync for assignment: {}. Entry: {:?}",
                         e,
                         entry.content_hash()
                     );
-                    match self.assignments_cache.get(Duration::MAX) {
-                        Some(cached) => return Ok(cached.to_vec()),
-                        None => {
-                            warn!("No valid assignment cache available; continuing to next entry.");
-                            bail!("failed to read all ip assignments")
-                        }
-                    }
                 }
             }
         }
@@ -512,8 +505,11 @@ impl RouterActor {
                     match self.candidates_cache.get(Duration::MAX) {
                         Some(cached) => return Ok(cached.to_vec()),
                         None => {
-                            warn!("No valid candidate cache available; continuing to next entry.");
-                            bail!("failed to read all ip candidates")
+                            warn!(
+                                "Pending blob sync for assignment: {}. Entry: {:?}",
+                                e,
+                                entry.content_hash()
+                            );
                         }
                     }
                 }

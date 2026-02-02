@@ -17,7 +17,9 @@ long-stress-test: build
 stress-test: build
 	TOPIC="test_topic_$$RANDOM"; \
 	echo "Using TOPIC=$$TOPIC"; \
-	sudo -E TOPIC=$$TOPIC docker compose -f docker_test/compose-stress.yaml up --build --abort-on-container-exit --remove-orphans
+	sudo -E WIFI_SIM_DELAY=100 TOPIC=$$TOPIC docker compose -f docker_test/compose-stress.yaml up --build --abort-on-container-exit --remove-orphans; \
+	echo ""; \
+	./docker_test/check_logs.sh
 
 clean-test:
 	sudo docker compose -f docker_test/compose-stress.yaml down -v

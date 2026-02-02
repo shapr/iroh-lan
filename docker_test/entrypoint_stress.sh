@@ -45,6 +45,16 @@ GAME_NETEM_REORDER_PCT=${GAME_NETEM_REORDER_PCT:-0.2}
 GAME_NETEM_REORDER_GAP=${GAME_NETEM_REORDER_GAP:-25}
 TOPIC="${TOPIC:-test_topic_default}"
 
+WIFI_SIM_DELAY=${WIFI_SIM_DELAY:-0}
+if [ "$WIFI_SIM_DELAY" -gt 0 ]; then
+    echo "[SETUP] Applying Global WiFi Simulation to eth0: ${WIFI_SIM_DELAY}ms"
+    tc qdisc add dev eth0 root netem \
+        delay ${WIFI_SIM_DELAY}ms 20ms distribution normal \
+        loss 1% \
+        reorder 5% 50
+fi
+
+
 signal_ready() {
     local signal_name="$1"
     touch "$COORD_DIR/$signal_name"

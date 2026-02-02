@@ -276,23 +276,6 @@ impl DirectActor {
             }
             Entry::Vacant(entry) => {
                 info!("No active connection to {}, initiating new connection", to);
-                if let Some(router) = &self.router {
-                    match router.get_ip_state().await {
-                        Ok(RouterIp::AssignedIp(_)) => {}
-                        _ => {
-                            info!("Skipping connect to {}: local IP not assigned", to);
-                            return Ok(());
-                        }
-                    }
-
-                    if router.get_ip_from_endpoint_id(to).await.is_err() {
-                        info!("Skipping connect to {}: remote IP not assigned", to);
-                        return Ok(());
-                    }
-                } else {
-                    info!("Skipping connect to {}: router not ready", to);
-                    return Ok(());
-                }
                 let conn = Conn::connect(
                     self.endpoint.clone(),
                     to,
@@ -316,32 +299,7 @@ impl DirectActor {
         if self.peers.contains_key(&to) {
             return Ok(());
         }
-
-        if let Some(router) = &self.router {
-            match router.get_ip_state().await {
-                Ok(RouterIp::AssignedIp(_)) => {}
-                _ => {
-                    info!(
-                        "Skipping ensure_connection to {}: local IP not assigned",
-                        to
-                    );
-                    return Ok(());
-                }
-            }
-
-            if router.get_ip_from_endpoint_id(to).await.is_err() {
-                info!(
-                    "Skipping ensure_connection to {}: remote IP not assigned",
-                    to
-                );
-                return Ok(());
-            }
-        } else {
-            info!("Skipping ensure_connection to {}: router not ready", to);
-            return Ok(());
-        }
-
-        info!("No active connection to {}, initiating new connection", to);
+        info!("No active connection to {}, initiating new connection (ensure_connection)", to);
         let conn = Conn::connect(
             self.endpoint.clone(),
             to,
