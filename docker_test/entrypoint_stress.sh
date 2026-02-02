@@ -205,10 +205,10 @@ elif [ "$ROLE" == "client" ]; then
     ping -b -i 0.2 -c 100 255.255.255.255 > /dev/null 2>&1 &
     PING_PID=$!
 
-    echo "TEST 2/5: Throughput (clean network) 10s"
+    echo "TEST 2/5: Throughput (clean network) 120s"
     run_iperf_once "$PEER_IP"
 
-    echo "TEST 3/5: Throughput (degraded network) 10s"
+    echo "TEST 3/5: Throughput (degraded network) 120s"
     if [ "$ENABLE_IPERF_NETEM" = "1" ]; then
         tc qdisc add dev "$NETEM_DEV" root netem \
             delay ${NETEM_DELAY_MS}ms ${NETEM_JITTER_MS}ms distribution normal \

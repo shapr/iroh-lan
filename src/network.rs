@@ -7,7 +7,10 @@ use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_auth::Authenticator;
-use iroh_blobs::store::{GcConfig, mem::{MemStore, Options}};
+use iroh_blobs::store::{
+        GcConfig,
+        mem::{MemStore, Options},
+    };
 use iroh_docs::protocol::Docs;
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
 use iroh_topic_tracker::TopicDiscoveryHook;
@@ -80,7 +83,7 @@ impl Network {
 
         let blobs = MemStore::new_with_opts(Options {
             gc_config: Some(GcConfig {
-                interval: Duration::from_millis(500),
+                interval: Duration::from_millis(1000),
                 add_protected: None,
             }),
         });

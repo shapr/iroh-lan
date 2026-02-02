@@ -1,18 +1,13 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::Ipv4Addr,
     time::Duration,
 };
 
 use ed25519_dalek::SigningKey;
 use futures::StreamExt;
-use iroh_blobs::{BlobsProtocol, store::mem::MemStore};
-use iroh_docs::{
-    AuthorId, Entry, NamespaceSecret,
-    api::Doc,
-    protocol::Docs,
-    store::{Query, QueryBuilder, SingleLatestPerKeyQuery},
-};
+use iroh_blobs::store::mem::MemStore;
+use iroh_docs::{AuthorId, Entry, NamespaceSecret, api::Doc, protocol::Docs, store::Query};
 
 use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
@@ -180,8 +175,8 @@ impl Builder {
                 rx,
                 blobs,
                 my_ip: RouterIp::NoIp,
-                assignments_cache: DocCache::new(),
-                candidates_cache: DocCache::new(),
+                assignments: BTreeMap::new(),
+                candidates: BTreeMap::new(),
             };
             router_actor.run().await
         });
@@ -220,8 +215,137 @@ struct RouterActor {
 
     pub my_ip: RouterIp,
 
-    assignments_cache: DocCache<IpAssignment>,
-    candidates_cache: DocCache<IpCandidate>,
+    assignments: BTreeMap<Ipv4Addr, IpAssignment>,
+    candidates: BTreeMap<(Ipv4Addr, EndpointId), IpCandidate>,
+}
+
+#[derive(Debug)]
+enum DocCacheUpdate {
+    UpsertAssignment(IpAssignment),
+    RemoveAssignment(Ipv4Addr),
+    UpsertCandidate(IpCandidate),
+    RemoveCandidate(Ipv4Addr, EndpointId),
+}
+
+async fn handle_doc_entry(
+    entry: Entry,
+    blobs: &MemStore,
+    updates: &tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>,
+    pending: &mut HashMap<iroh_blobs::Hash, Vec<Entry>>,
+    download_expected: bool,
+) {
+    let key = match std::str::from_utf8(entry.key()) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!("Invalid entry key utf8: {}", e);
+            return;
+        }
+    };
+
+    let assigned_prefix = key_ip_assigned_prefix();
+    let candidate_prefix = key_ip_candidate_prefix();
+
+    if entry.content_len() == 0 {
+        if key.starts_with(&assigned_prefix) {
+            if let Some(ip_str) = key.strip_prefix(&assigned_prefix)
+                && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+            {
+                updates.send(DocCacheUpdate::RemoveAssignment(ip)).ok();
+            }
+        } else if key.starts_with(&candidate_prefix) {
+            let parts: Vec<&str> = key.split('/').collect();
+            if parts.len() >= 5
+                && let (Ok(ip), Ok(eid)) =
+                    (parts[3].parse::<Ipv4Addr>(), parts[4].parse::<EndpointId>())
+            {
+                updates.send(DocCacheUpdate::RemoveCandidate(ip, eid)).ok();
+            }
+        }
+        return;
+    }
+
+    let val_bytes = match blobs.get_bytes(entry.content_hash()).await {
+        Ok(b) => {
+            debug!("Blob found for entry key {}", entry.content_hash());
+            b
+        }
+        Err(_) => {
+            if download_expected {
+                warn!(
+                    "Blob not found for entry key {}, deferring processing",
+                    entry.content_hash()
+                );
+            }
+            pending.entry(entry.content_hash()).or_default().push(entry);
+            return;
+        }
+    };
+
+    // only tag after get_bytes succeeds
+    blobs.tags().create(entry.content_hash()).await.ok();
+
+    if key.starts_with(&assigned_prefix) {
+        match postcard::from_bytes::<IpAssignment>(&val_bytes) {
+            Ok(val) => {
+                updates.send(DocCacheUpdate::UpsertAssignment(val)).ok();
+            }
+            Err(e) => warn!("Failed to deserialize assignment: {}", e),
+        }
+    } else if key.starts_with(&candidate_prefix) {
+        match postcard::from_bytes::<IpCandidate>(&val_bytes) {
+            Ok(val) => {
+                updates.send(DocCacheUpdate::UpsertCandidate(val)).ok();
+            }
+            Err(e) => warn!("Failed to deserialize candidate: {}", e),
+        }
+    }
+}
+
+async fn run_doc_worker(
+    doc: Doc,
+    blobs: MemStore,
+    updates: tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>,
+) {
+    let mut pending_blobs: HashMap<iroh_blobs::Hash, Vec<Entry>> = HashMap::new();
+
+    match doc.get_many(Query::all()).await {
+        Ok(stream) => {
+            let entries = stream.collect::<Vec<_>>().await;
+            for entry in entries.into_iter().flatten() {
+                handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, true).await;
+            }
+        }
+        Err(e) => warn!("Failed to populate cache: {}", e),
+    }
+
+    let mut docs_sub = match doc.subscribe().await {
+        Ok(sub) => sub,
+        Err(e) => {
+            warn!("Docs subscription failed: {}", e);
+            return;
+        }
+    };
+
+    while let Some(event) = docs_sub.next().await {
+        match event {
+            Ok(e) => match e {
+                iroh_docs::engine::LiveEvent::InsertLocal { entry }
+                | iroh_docs::engine::LiveEvent::InsertRemote { entry, .. } => {
+                    handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, false).await;
+                }
+                iroh_docs::engine::LiveEvent::ContentReady { hash } => {
+                    if let Some(entries) = pending_blobs.remove(&hash) {
+                        for entry in entries {
+                            handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, true)
+                                .await;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Err(e) => warn!("Docs subscription stream error: {:?}", e),
+        }
+    }
 }
 
 impl Router {
@@ -262,16 +386,14 @@ impl Router {
             .call(act!(actor => async move {
                 let mut map: BTreeMap<EndpointId, Option<Ipv4Addr>> = BTreeMap::new();
 
-                if let Ok(assignments) = actor.read_all_ip_assignments().await {
-                    for a in assignments {
-                        map.insert(a.endpoint_id, Some(a.ip));
-                    }
+                let assignments = actor.read_all_ip_assignments();
+                for a in assignments {
+                    map.insert(a.endpoint_id, Some(a.ip));
                 }
 
-                if let Ok(cands) = actor.read_all_ip_candidates().await {
-                    for c in cands {
-                        map.entry(c.endpoint_id).or_insert(None);
-                    }
+                let cands = actor.read_all_ip_candidates();
+                for c in cands {
+                    map.entry(c.endpoint_id).or_insert(None);
                 }
 
                 map.remove(&actor.endpoint_id);
@@ -298,6 +420,13 @@ impl Actor<anyhow::Error> for RouterActor {
         debug!("RouterActor started. EndpointId: {}", self.endpoint_id);
 
         let mut last_ip_state = self.my_ip.clone();
+
+        let (doc_update_tx, mut doc_update_rx) = tokio::sync::mpsc::unbounded_channel();
+        let doc = self.doc.clone();
+        let blobs = self.blobs.clone();
+        tokio::spawn(async move {
+            run_doc_worker(doc, blobs, doc_update_tx).await;
+        });
         loop {
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => {
@@ -341,6 +470,22 @@ impl Actor<anyhow::Error> for RouterActor {
                     }
                 }
 
+                Some(update) = doc_update_rx.recv() => {
+                    match update {
+                        DocCacheUpdate::UpsertAssignment(val) => {
+                            self.assignments.insert(val.ip, val);
+                        }
+                        DocCacheUpdate::RemoveAssignment(ip) => {
+                            self.assignments.remove(&ip);
+                        }
+                        DocCacheUpdate::UpsertCandidate(val) => {
+                            self.candidates.insert((val.ip, val.endpoint_id), val);
+                        }
+                        DocCacheUpdate::RemoveCandidate(ip, endpoint_id) => {
+                            self.candidates.remove(&(ip, endpoint_id));
+                        }
+                    }
+                }
             }
         }
 
@@ -366,20 +511,6 @@ pub struct IpCandidate {
     pub last_updated: u64,
 }
 
-async fn entry_to_value<S: for<'a> Deserialize<'a>>(
-    blobs: &BlobsProtocol,
-    entry: &Entry,
-) -> anyhow::Result<S> {
-    let b = blobs.get_bytes(entry.content_hash()).await?;
-    postcard::from_bytes::<S>(&b).context("failed to deserialize value")
-}
-
-fn query_prefix(q: impl Into<String>) -> impl Into<Query> {
-    QueryBuilder::<SingleLatestPerKeyQuery>::default()
-        .key_prefix(q.into())
-        .build()
-}
-
 fn key_ip_assigned(ip: Ipv4Addr) -> String {
     format!("/assigned/ip/{ip}")
 }
@@ -396,115 +527,16 @@ fn key_ip_candidate_prefix() -> String {
     "/candidates/ip/".to_string()
 }
 
-#[derive(Debug, Clone)]
-struct DocCache<T> {
-    value: Vec<T>,
-    last_read: Option<tokio::time::Instant>,
-}
-
-impl<T> DocCache<T> {
-    fn new() -> Self {
-        Self {
-            value: Vec::new(),
-            last_read: None,
-        }
-    }
-
-    fn get(&self, ttl: Duration) -> Option<&[T]> {
-        match self.last_read {
-            Some(ts) if ts.elapsed() < ttl => Some(&self.value),
-            _ => None,
-        }
-    }
-
-    fn set(&mut self, value: Vec<T>) {
-        self.value = value;
-        self.last_read = Some(tokio::time::Instant::now());
-    }
-
-    fn invalidate(&mut self) {
-        self.last_read = None;
-    }
-}
-
 impl RouterActor {
-    const DOC_READ_MIN_INTERVAL: Duration = Duration::from_secs(2);
     const ASSIGNMENT_STALE_SECS: u64 = 300;
     const CANDIDATE_STALE_SECS: u64 = 60;
 
-    async fn read_all_ip_assignments(&mut self) -> Result<Vec<IpAssignment>> {
-        trace!("Reading all IP assignments");
-        if let Some(cached) = self.assignments_cache.get(Self::DOC_READ_MIN_INTERVAL) {
-            return Ok(cached.to_vec());
-        }
-        let entries = self
-            .doc
-            .get_many(query_prefix(key_ip_assigned_prefix()))
-            .await?
-            .collect::<Vec<_>>()
-            .await
-            .iter()
-            .filter_map(|entry| {
-                if let Ok(entry) = entry.as_ref() {
-                    Some(entry)
-                } else {
-                    warn!("[PEER] entry is not ok!");
-                    None
-                }
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut assignments = Vec::new();
-        for entry in entries {
-            match entry_to_value::<IpAssignment>(&self.blobs, &entry).await {
-                Ok(assignment) => assignments.push(assignment),
-                Err(e) => {
-                    warn!(
-                        "Pending blob sync for assignment: {:?}. Entry: {:?}",
-                        e,
-                        entry.content_hash()
-                    );
-                }
-            }
-        }
-        trace!("Found {} IP assignments", assignments.len());
-        self.assignments_cache.set(assignments.clone());
-        Ok(assignments)
+    fn read_all_ip_assignments(&self) -> Vec<IpAssignment> {
+        self.assignments.values().cloned().collect()
     }
 
-    async fn read_all_ip_candidates(&mut self) -> Result<Vec<IpCandidate>> {
-        trace!("Reading all IP candidates");
-        if let Some(cached) = self.candidates_cache.get(Self::DOC_READ_MIN_INTERVAL) {
-            return Ok(cached.to_vec());
-        }
-        let entries = self
-            .doc
-            .get_many(query_prefix(key_ip_candidate_prefix()))
-            .await?
-            .collect::<Vec<_>>()
-            .await
-            .iter()
-            .filter_map(|entry| entry.as_ref().ok())
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut candidates = Vec::new();
-        for entry in entries {
-            match entry_to_value::<IpCandidate>(&self.blobs, &entry).await {
-                Ok(candidate) => candidates.push(candidate),
-                Err(e) => {
-                    warn!(
-                        "Pending blob sync for candidate: {:?}. Entry: {:?}",
-                        e,
-                        entry.content_hash()
-                    );
-                }
-            }
-        }
-        trace!("Found {} IP candidates", candidates.len());
-        self.candidates_cache.set(candidates.clone());
-        Ok(candidates)
+    fn read_all_ip_candidates(&self) -> Vec<IpCandidate> {
+        self.candidates.values().cloned().collect()
     }
 
     async fn clear_ip_candidate(&mut self, ip: Ipv4Addr, endpoint_id: EndpointId) -> Result<()> {
@@ -512,29 +544,28 @@ impl RouterActor {
         self.doc
             .del(self.author_id, key_ip_candidate(ip, endpoint_id))
             .await?;
-        self.candidates_cache.invalidate();
         Ok(())
     }
 
     // Assigned IPs
-    async fn read_ip_assignment(&mut self, ip: Ipv4Addr) -> Result<IpAssignment> {
-        self.read_all_ip_assignments()
-            .await?
-            .into_iter()
-            .find(|assignment| assignment.ip == ip)
+    fn read_ip_assignment(&self, ip: Ipv4Addr) -> Result<IpAssignment> {
+        self.assignments
+            .get(&ip)
+            .cloned()
             .context("no assignment found")
     }
 
     // Candidate IPs
-    async fn read_ip_candidates(&mut self, ip: Ipv4Addr) -> Result<Vec<IpCandidate>> {
-        let candidates = self.read_all_ip_candidates().await?;
+    fn read_ip_candidates(&self, ip: Ipv4Addr) -> Result<Vec<IpCandidate>> {
         let now = current_time();
-        let filtered = candidates
-            .into_iter()
-            .filter(|candidate| candidate.ip == ip)
+        let filtered = self
+            .candidates
+            .values()
+            .filter(|c| c.ip == ip)
             .filter(|candidate| {
                 now.saturating_sub(candidate.last_updated) <= Self::CANDIDATE_STALE_SECS
             })
+            .cloned()
             .collect::<Vec<_>>();
         debug!("candidates for {ip}: {}", filtered.len());
         Ok(filtered)
@@ -544,7 +575,7 @@ impl RouterActor {
     async fn write_ip_assignment(&mut self, ip: Ipv4Addr, endpoint_id: EndpointId) -> Result<()> {
         info!("Attempting to assign IP {} to {}", ip, endpoint_id);
 
-        let existing_assignment = self.read_ip_assignment(ip).await.ok();
+        let existing_assignment = self.read_ip_assignment(ip).ok();
 
         if let Some(existing) = &existing_assignment {
             if existing.endpoint_id != endpoint_id {
@@ -552,7 +583,7 @@ impl RouterActor {
             }
         } else {
             // New assignment. check for multiple candidates
-            let candidates = self.read_ip_candidates(ip).await?;
+            let candidates = self.read_ip_candidates(ip)?;
             if candidates.is_empty() {
                 bail!("no candidates for this ip");
             }
@@ -567,8 +598,6 @@ impl RouterActor {
         }
 
         // We are the chosen one!
-        // 1. write our ip assignment
-        // 2. delete all candidates for this ip
         debug!("Winning candidate for IP {}. Writing assignment.", ip);
         let data = postcard::to_stdvec(&IpAssignment {
             ip,
@@ -579,12 +608,7 @@ impl RouterActor {
             .set_bytes(self.author_id, key_ip_assigned(ip), data)
             .await?;
 
-        self.assignments_cache.invalidate();
-
         self.clear_ip_candidate(ip, endpoint_id).await.ok();
-
-        self.candidates_cache.invalidate();
-
         Ok(())
     }
 
@@ -596,12 +620,12 @@ impl RouterActor {
     ) -> Result<IpCandidate> {
         debug!("Writing IP candidate {} for {}", ip, endpoint_id);
         // already assigned? don't write
-        if self.read_ip_assignment(ip).await.is_ok() {
+        if self.read_ip_assignment(ip).is_ok() {
             anyhow::bail!("ip already assigned");
         }
 
         // read existing candidates; Ok(vec![]) when none exist
-        let candidates = self.read_ip_candidates(ip).await.unwrap_or_default();
+        let candidates = self.read_ip_candidates(ip).unwrap_or_default();
 
         // if someone else is already a candidate, treat as contested and skip writing
         if candidates.iter().any(|c| c.endpoint_id != endpoint_id) {
@@ -619,22 +643,15 @@ impl RouterActor {
         self.doc
             .set_bytes(self.author_id, key_ip_candidate(ip, endpoint_id), data)
             .await?;
-        self.candidates_cache.invalidate();
         Ok(candidate)
     }
 
     async fn get_endpoint_id_from_ip(&mut self, ip: Ipv4Addr) -> Result<EndpointId> {
-        self.read_all_ip_assignments()
-            .await?
-            .iter()
-            .find(|assignment| assignment.ip == ip)
-            .map(|a| a.endpoint_id)
-            .ok_or_else(|| anyhow::anyhow!("no endpoint_id found for ip"))
+        self.read_ip_assignment(ip).map(|a| a.endpoint_id)
     }
 
     async fn get_ip_from_endpoint_id(&mut self, endpoint_id: EndpointId) -> Result<Ipv4Addr> {
         self.read_all_ip_assignments()
-            .await?
             .iter()
             .find(|assignment| assignment.endpoint_id == endpoint_id)
             .map(|a| a.ip)
@@ -659,7 +676,7 @@ impl RouterActor {
             RouterIp::AquiringIp(ip_candidate, start_time) => {
                 let elapsed = start_time.elapsed();
 
-                if let Ok(candidates) = self.read_ip_candidates(ip_candidate.ip).await
+                if let Ok(candidates) = self.read_ip_candidates(ip_candidate.ip)
                     && candidates.iter().any(|c| {
                         c.endpoint_id != self.endpoint_id && self.endpoint_id < c.endpoint_id
                     })
@@ -711,7 +728,7 @@ impl RouterActor {
                 // Wait 2 seconds to ensure propagation
                 if start_time.elapsed() > Duration::from_secs(2) {
                     trace!("Verifying IP assignment logic for {}", ip);
-                    let assignment = self.read_ip_assignment(ip).await;
+                    let assignment = self.read_ip_assignment(ip);
                     match assignment {
                         Ok(a) if a.endpoint_id == self.endpoint_id => {
                             info!("Verified ownership of IP: {}", ip);
@@ -729,7 +746,7 @@ impl RouterActor {
                 Ok(false)
             }
             RouterIp::AssignedIp(my_ip) => {
-                match self.read_ip_assignment(my_ip).await {
+                match self.read_ip_assignment(my_ip) {
                     Ok(ip_assignment) => {
                         if ip_assignment.endpoint_id != self.endpoint_id {
                             self.my_ip = RouterIp::NoIp;
@@ -763,8 +780,8 @@ impl RouterActor {
     }
 
     async fn get_next_ip(&mut self) -> Result<Ipv4Addr> {
-        let all_assigned = self.read_all_ip_assignments().await?;
-        let all_candidates = self.read_all_ip_candidates().await?;
+        let all_assigned = self.read_all_ip_assignments();
+        let all_candidates = self.read_all_ip_candidates();
 
         let mut used_ips = all_assigned
             .iter()
@@ -801,7 +818,7 @@ impl RouterActor {
         let now = current_time();
 
         // Cleanup assignments
-        for a in self.read_all_ip_assignments().await? {
+        for a in self.read_all_ip_assignments() {
             if now.saturating_sub(a.last_updated) > Self::ASSIGNMENT_STALE_SECS {
                 /*if a.endpoint_id == self.endpoint_id {
                     error!(
@@ -820,13 +837,12 @@ impl RouterActor {
                     warn!("Failed to delete stale IP {}: {}", a.ip, e);
                 } else {
                     info!("Cleaned up assignment: {:?}", a);
-                    self.assignments_cache.invalidate();
                 }
             }
         }
 
         // Cleanup candidates
-        for c in self.read_all_ip_candidates().await? {
+        for c in self.read_all_ip_candidates() {
             if now.saturating_sub(c.last_updated) > Self::CANDIDATE_STALE_SECS {
                 info!(
                     "Removing stale IP candidate for {} (last updated {}s ago)",
@@ -834,7 +850,6 @@ impl RouterActor {
                     now - c.last_updated
                 );
                 self.clear_ip_candidate(c.ip, c.endpoint_id).await.ok();
-                self.candidates_cache.invalidate();
             }
         }
         Ok(())
