@@ -460,9 +460,22 @@ impl RouterActor {
 
         let mut assignments = Vec::new();
         for entry in entries {
-            if let Ok(assignment) = entry_to_value::<IpAssignment>(self.blobs.clone(), &entry).await
-            {
-                assignments.push(assignment);
+            match entry_to_value::<IpAssignment>(self.blobs.clone(), &entry).await {
+                Ok(assignment) => assignments.push(assignment),
+                Err(e) => {
+                    warn!(
+                        "Failed to read assignment blob (blob missing?): {}. Entry: {:?}",
+                        e,
+                        entry.content_hash()
+                    );
+                    match self.assignments_cache.get(Duration::MAX) {
+                        Some(cached) => return Ok(cached.to_vec()),
+                        None => {
+                            warn!("No valid assignment cache available; continuing to next entry.");
+                            bail!("failed to read all ip assignments")
+                        }
+                    }
+                }
             }
         }
         trace!("Found {} IP assignments", assignments.len());
@@ -488,8 +501,22 @@ impl RouterActor {
 
         let mut candidates = Vec::new();
         for entry in entries {
-            if let Ok(candidate) = entry_to_value::<IpCandidate>(self.blobs.clone(), &entry).await {
-                candidates.push(candidate);
+            match entry_to_value::<IpCandidate>(self.blobs.clone(), &entry).await {
+                Ok(candidate) => candidates.push(candidate),
+                Err(e) => {
+                    warn!(
+                        "Failed to read candidate blob (blob missing?): {}. Entry: {:?}",
+                        e,
+                        entry.content_hash()
+                    );
+                    match self.candidates_cache.get(Duration::MAX) {
+                        Some(cached) => return Ok(cached.to_vec()),
+                        None => {
+                            warn!("No valid candidate cache available; continuing to next entry.");
+                            bail!("failed to read all ip candidates")
+                        }
+                    }
+                }
             }
         }
         trace!("Found {} IP candidates", candidates.len());
