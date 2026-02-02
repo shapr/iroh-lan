@@ -1,6 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::Ipv4Addr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -281,9 +285,11 @@ async fn handle_doc_entry(
                     e
                 );
             }
-            pending.entry(entry.content_hash()).or_default().push(entry);
+            let hash = entry.content_hash();
+            pending.entry(hash).or_default().push(entry);
             let err_str = e.to_string();
-            return err_str.contains("LeafHashMismatch");
+            debug!("Blob get_bytes failed for {}: {}", hash, err_str);
+            return true;
         }
     };
 
@@ -308,13 +314,30 @@ async fn handle_doc_entry(
     false
 }
 
-async fn maybe_resync_doc(doc: &Doc, peers_rx: &watch::Receiver<Vec<EndpointAddr>>) {
-    let peers = peers_rx.borrow().clone();
-    if !peers.is_empty()
-        && let Err(e) = doc.start_sync(peers).await
+fn schedule_resync_doc(
+    doc: Doc,
+    peers_rx: watch::Receiver<Vec<EndpointAddr>>,
+    resync_in_flight: Arc<AtomicBool>,
+) {
+    if resync_in_flight
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
     {
-        warn!("Failed to resync doc for pending blobs: {}", e);
+        return;
     }
+
+    tokio::spawn(async move {
+        let peers = peers_rx.borrow().clone();
+        if !peers.is_empty() {
+            let res = tokio::time::timeout(Duration::from_secs(5), doc.start_sync(peers)).await;
+            if let Err(e) = res {
+                warn!("Doc resync timed out: {}", e);
+            } else if let Ok(Err(e)) = res {
+                warn!("Failed to resync doc for pending blobs: {}", e);
+            }
+        }
+        resync_in_flight.store(false, Ordering::SeqCst);
+    });
 }
 
 async fn run_doc_worker(
@@ -324,6 +347,9 @@ async fn run_doc_worker(
     updates: tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>,
 ) {
     let mut pending_blobs: HashMap<iroh_blobs::Hash, Vec<Entry>> = HashMap::new();
+    let mut retry_tick = tokio::time::interval(Duration::from_secs(5));
+    retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let resync_in_flight = Arc::new(AtomicBool::new(false));
 
     match doc.get_many(Query::all()).await {
         Ok(stream) => {
@@ -332,7 +358,11 @@ async fn run_doc_worker(
                 let needs_resync =
                     handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, true).await;
                 if needs_resync {
-                    maybe_resync_doc(&doc, &doc_peers_rx).await;
+                    schedule_resync_doc(
+                        doc.clone(),
+                        doc_peers_rx.clone(),
+                        resync_in_flight.clone(),
+                    );
                 }
             }
         }
@@ -347,54 +377,86 @@ async fn run_doc_worker(
         }
     };
 
-    while let Some(event) = docs_sub.next().await {
-        match event {
-            Ok(e) => match e {
-                iroh_docs::engine::LiveEvent::InsertLocal { entry }
-                | iroh_docs::engine::LiveEvent::InsertRemote { entry, .. } => {
-                    let needs_resync =
-                        handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, false).await;
-                    if needs_resync {
-                        maybe_resync_doc(&doc, &doc_peers_rx).await;
-                    }
-                }
-                iroh_docs::engine::LiveEvent::ContentReady { hash } => {
-                    if let Some(entries) = pending_blobs.remove(&hash) {
-                        for entry in entries {
+    loop {
+        tokio::select! {
+            Some(event) = docs_sub.next() => {
+                match event {
+                    Ok(e) => match e {
+                        iroh_docs::engine::LiveEvent::InsertLocal { entry }
+                        | iroh_docs::engine::LiveEvent::InsertRemote { entry, .. } => {
                             let needs_resync =
-                                handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, true)
-                                    .await;
+                                handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, false).await;
                             if needs_resync {
-                                maybe_resync_doc(&doc, &doc_peers_rx).await;
+                                schedule_resync_doc(doc.clone(), doc_peers_rx.clone(), resync_in_flight.clone());
                             }
                         }
-                    }
-                }
-                iroh_docs::engine::LiveEvent::PendingContentReady => {
-                    if !pending_blobs.is_empty() {
-                        maybe_resync_doc(&doc, &doc_peers_rx).await;
-
-                        let pending = std::mem::take(&mut pending_blobs);
-                        for (_hash, entries) in pending {
-                            for entry in entries {
-                                let needs_resync = handle_doc_entry(
-                                    entry,
-                                    &blobs,
-                                    &updates,
-                                    &mut pending_blobs,
-                                    true,
-                                )
-                                .await;
-                                if needs_resync {
-                                    maybe_resync_doc(&doc, &doc_peers_rx).await;
+                        iroh_docs::engine::LiveEvent::ContentReady { hash } => {
+                            if let Some(entries) = pending_blobs.remove(&hash) {
+                                for entry in entries {
+                                    let needs_resync = handle_doc_entry(
+                                        entry,
+                                        &blobs,
+                                        &updates,
+                                        &mut pending_blobs,
+                                        true,
+                                    )
+                                    .await;
+                                    if needs_resync {
+                                        schedule_resync_doc(doc.clone(), doc_peers_rx.clone(), resync_in_flight.clone());
+                                    }
                                 }
                             }
                         }
+                        iroh_docs::engine::LiveEvent::PendingContentReady => {
+                            if !pending_blobs.is_empty() {
+                                schedule_resync_doc(doc.clone(), doc_peers_rx.clone(), resync_in_flight.clone());
+
+                                let pending = std::mem::take(&mut pending_blobs);
+                                for (_hash, entries) in pending {
+                                    for entry in entries {
+                                        let needs_resync = handle_doc_entry(
+                                            entry,
+                                            &blobs,
+                                            &updates,
+                                            &mut pending_blobs,
+                                            true,
+                                        )
+                                        .await;
+                                        if needs_resync {
+                                            schedule_resync_doc(doc.clone(), doc_peers_rx.clone(), resync_in_flight.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    Err(e) => warn!("Docs subscription stream error: {:?}", e),
+                }
+            }
+            _ = retry_tick.tick() => {
+                if !pending_blobs.is_empty() {
+                    debug!("Retry tick: {} pending blobs", pending_blobs.len());
+                    schedule_resync_doc(doc.clone(), doc_peers_rx.clone(), resync_in_flight.clone());
+                    let pending = std::mem::take(&mut pending_blobs);
+                    for (_hash, entries) in pending {
+                        for entry in entries {
+                            let needs_resync = handle_doc_entry(
+                                entry,
+                                &blobs,
+                                &updates,
+                                &mut pending_blobs,
+                                true,
+                            )
+                            .await;
+                            if needs_resync {
+                                schedule_resync_doc(doc.clone(), doc_peers_rx.clone(), resync_in_flight.clone());
+                            }
+                        }
                     }
                 }
-                _ => {}
-            },
-            Err(e) => warn!("Docs subscription stream error: {:?}", e),
+            }
+            else => break,
         }
     }
 }
