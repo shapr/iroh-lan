@@ -63,6 +63,7 @@ struct ConnActor {
     write_tx: Option<tokio::sync::mpsc::Sender<DirectMessage>>,
 
     read_task: Option<tokio::task::JoinHandle<()>>,
+    connect_task: Option<tokio::task::JoinHandle<()>>,
 
     queue_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     dropped_packets: u64,
@@ -125,36 +126,10 @@ impl Conn {
         });
         let s = Self { api };
 
-        tokio::spawn({
-            let s = s.clone();
-            async move {
-                match endpoint.connect(endpoint_id, crate::Direct::ALPN).await {
-                    Ok(conn) => match conn.open_bi().await {
-                        Ok((send, recv)) => {
-                            let _ = s.incoming_connection(conn, send, recv).await;
-                        }
-                        Err(e) => {
-                            warn!("Failed to open bi-stream during initial connection: {}", e);
-                            let _ = s
-                                    .api
-                                    .call(
-                                        act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                                    )
-                                    .await;
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Initial connection failed: {}", e);
-                        let _ = s
-                            .api
-                            .call(
-                                act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                            )
-                            .await;
-                    }
-                }
-            }
-        });
+        let _ = s
+            .api
+            .call(act_ok!(actor => async move { actor.start_outgoing_connect(false) }))
+            .await;
 
         s
     }
@@ -352,6 +327,7 @@ impl ConnActor {
             read_task,
             write_task,
             write_tx,
+            connect_task: None,
             queue_len,
             sender_queue: VecDeque::with_capacity(QUEUE_SIZE),
             conn,
@@ -386,6 +362,9 @@ impl ConnActor {
         self.state = ConnState::Closed;
         if let Some(conn) = self.conn.as_mut() {
             conn.close(VarInt::from_u32(400), b"Connection closed by user");
+        }
+        if let Some(task) = self.connect_task.take() {
+            task.abort();
         }
         if let Some(task) = self.read_task.take() {
             task.abort();
@@ -479,6 +458,9 @@ impl ConnActor {
         recv_stream: RecvStream,
     ) -> Result<()> {
         info!("Incoming connection from: {}", conn.remote_id());
+        if let Some(task) = self.connect_task.take() {
+            task.abort();
+        }
         if conn.close_reason().is_some() {
             warn!("Incoming connection already closed");
             self.state = ConnState::Closed;
@@ -547,6 +529,9 @@ impl ConnActor {
             warn!("Cannot reconnect, actor is closed");
             return Err(anyhow::anyhow!("actor closed for good"));
         }
+        if let Some(task) = self.connect_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.read_task.take() {
             task.abort();
         }
@@ -565,45 +550,60 @@ impl ConnActor {
         self.last_reconnect = tokio::time::Instant::now();
 
         self.conn = None;
+        self.start_outgoing_connect(true);
+        Ok(())
+    }
 
-        tokio::spawn({
-            let api = self.self_handle.clone();
-            let endpoint = self.endpoint.clone();
-            let conn_node_id = self.conn_endpoint_id;
-            async move {
-                debug!("Initiating reconnection to {}", conn_node_id);
-                if let Ok(conn) = endpoint.connect(conn_node_id, crate::Direct::ALPN).await {
-                    debug!("Reconnection successful");
-                    match conn.open_bi().await {
-                        Ok((send, recv)) => {
-                            let _ = api
-                                .call(act!(actor => actor.incoming_connection(conn, send, recv)))
-                                .await;
+    fn start_outgoing_connect(&mut self, is_reconnect: bool) {
+        if self
+            .connect_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+
+        let api = self.self_handle.clone();
+        let endpoint = self.endpoint.clone();
+        let conn_node_id = self.conn_endpoint_id;
+        self.connect_task = Some(tokio::spawn(async move {
+            debug!(
+                "Initiating {}connection to {}",
+                if is_reconnect { "re" } else { "" },
+                conn_node_id
+            );
+            match endpoint.connect(conn_node_id, crate::Direct::ALPN).await {
+                Ok(conn) => match conn.open_bi().await {
+                    Ok((send, recv)) => {
+                        let _ = api
+                            .call(act!(actor => actor.incoming_connection(conn, send, recv)))
+                            .await;
+                        if is_reconnect {
                             let _ = api
                                 .call(act_ok!(actor => async move { actor.reconnect_count.store(0, std::sync::atomic::Ordering::SeqCst) }))
                                 .await;
                         }
-                        Err(e) => {
-                            warn!("Auth failed during reconnection: {}", e);
-                            let _ = api
-                                .call(
-                                    act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                                )
-                                .await;
-                        }
                     }
-                } else {
-                    warn!("Reconnection failed");
-                    let _ = api.call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) })).await;
+                    Err(e) => {
+                        warn!("Failed to open bi-stream during connection: {}", e);
+                        let _ = api
+                            .call(act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }))
+                            .await;
+                    }
+                },
+                Err(e) => {
+                    warn!("Connection failed: {}", e);
+                    if is_reconnect {
+                        let _ = api
+                            .call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) }))
+                            .await;
+                    }
                     let _ = api
-                        .call(
-                            act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                        )
+                        .call(act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }))
                         .await;
                 }
             }
-        });
-        Ok(())
+        }));
     }
 }
 

@@ -274,6 +274,10 @@ impl DirectActor {
     }
 
     async fn ensure_connection(&mut self, to: EndpointId) -> Result<()> {
+        if self.endpoint.id() > to {
+            debug!("Skipping proactive connection to {} (prefer incoming)", to);
+            return Ok(());
+        }
         if self.peers.contains_key(&to) {
             return Ok(());
         }
