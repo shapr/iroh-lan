@@ -6,7 +6,7 @@ use std::{
 
 use ed25519_dalek::SigningKey;
 use futures::StreamExt;
-use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::{BlobsProtocol, store::mem::MemStore};
 use iroh_docs::{
     AuthorId, Entry, NamespaceSecret,
     api::Doc,
@@ -39,7 +39,7 @@ pub struct Builder {
     endpoint: Option<Endpoint>,
     gossip: Option<Gossip>,
     docs: Option<Docs>,
-    blobs: MemStore,
+    blobs: BlobsProtocol,
 }
 
 impl Builder {
@@ -52,7 +52,7 @@ impl Builder {
             endpoint: None,
             gossip: None,
             docs: None,
-            blobs: MemStore::new(),
+            blobs: BlobsProtocol::new(&MemStore::new(), None),
         }
     }
 
@@ -86,7 +86,7 @@ impl Builder {
         self
     }
 
-    pub fn blobs(mut self, blobs: MemStore) -> Self {
+    pub fn blobs(mut self, blobs: BlobsProtocol) -> Self {
         self.blobs = blobs;
         self
     }
@@ -210,7 +210,7 @@ struct RouterActor {
     pub _gossip_sender: GossipSender,
     pub gossip_monitor: GossipReceiver,
 
-    pub(crate) blobs: MemStore,
+    pub(crate) blobs: BlobsProtocol,
     pub(crate) _docs: Docs,
     pub(crate) doc: Doc,
     pub(crate) author_id: AuthorId,
@@ -349,10 +349,7 @@ impl Actor<anyhow::Error> for RouterActor {
 }
 
 fn current_time() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    chrono::Utc::now().timestamp() as u64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,7 +367,7 @@ pub struct IpCandidate {
 }
 
 async fn entry_to_value<S: for<'a> Deserialize<'a>>(
-    blobs: &MemStore,
+    blobs: &BlobsProtocol,
     entry: &Entry,
 ) -> anyhow::Result<S> {
     let b = blobs.get_bytes(entry.content_hash()).await?;

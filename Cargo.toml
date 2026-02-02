@@ -34,6 +34,7 @@ z32 = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
+chrono = { version = "0.4" }
 
 iroh-auth = { version = "0.1.2" }
 actor-helper = "0.2"
