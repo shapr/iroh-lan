@@ -7,10 +7,7 @@ use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_auth::Authenticator;
-use iroh_blobs::store::{
-    GcConfig,
-    mem::{MemStore, Options},
-};
+use iroh_blobs::store::{GcConfig, mem::{MemStore, Options}};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
 use iroh_topic_tracker::TopicDiscoveryHook;
@@ -81,13 +78,12 @@ impl Network {
             .membership_config(gossip_config)
             .spawn(endpoint.clone());
 
-        let store = MemStore::new_with_opts(Options {
+        let blobs = MemStore::new_with_opts(Options {
             gc_config: Some(GcConfig {
                 interval: Duration::from_millis(500),
                 add_protected: None,
             }),
         });
-        let blobs = iroh_blobs::BlobsProtocol::new(&store, None);
         let docs = Docs::memory()
             .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
             .await?;
