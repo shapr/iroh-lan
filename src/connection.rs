@@ -279,6 +279,29 @@ impl Actor<anyhow::Error> for ConnActor {
 }
 
 impl ConnActor {
+    async fn handle_read_error(&mut self) {
+        if let Some(reason) = self.conn.as_ref().and_then(|c| c.close_reason()) {
+            debug!(
+                "Connection close reason for {}: {:?}",
+                self.conn_endpoint_id, reason
+            );
+
+            if let iroh::endpoint::ConnectionError::ApplicationClosed(app_close) = reason {
+                let is_duplicate = app_close.error_code == VarInt::from_u32(409)
+                    || String::from_utf8_lossy(app_close.reason.as_ref())
+                        .contains("duplicate connection");
+                if is_duplicate {
+                    self.reconnect_backoff = RECONNECT_BACKOFF_MAX;
+                    self.last_reconnect = tokio::time::Instant::now();
+                }
+            }
+        }
+
+        self.set_state(ConnState::Disconnected);
+    }
+}
+
+impl ConnActor {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         rx: Receiver<Action<ConnActor>>,
@@ -663,7 +686,10 @@ async fn retry_read_loop(
             Err(e) => {
                 warn!("Stream read error: {}", e);
                 let _ = api
-                    .call(act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }))
+                    .call(act_ok!(actor => async move {
+                        actor.handle_read_error().await;
+                        Ok::<(), anyhow::Error>(())
+                    }))
                     .await;
                 break;
             }

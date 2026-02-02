@@ -8,6 +8,7 @@ use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use iroh_blobs::store::mem::MemStore;
 use iroh_docs::{AuthorId, Entry, NamespaceSecret, api::Doc, protocol::Docs, store::Query};
+use tokio::sync::watch;
 
 use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
@@ -137,6 +138,7 @@ impl Builder {
             .neighbors()
             .map(EndpointAddr::new)
             .collect::<Vec<_>>();
+        let (doc_peers_tx, _doc_peers_rx) = watch::channel(doc_peers.clone());
 
         debug!("[Doc peers]: {:?}", doc_peers);
 
@@ -177,6 +179,7 @@ impl Builder {
                 my_ip: RouterIp::NoIp,
                 assignments: BTreeMap::new(),
                 candidates: BTreeMap::new(),
+                doc_peers_tx,
             };
             router_actor.run().await
         });
@@ -217,6 +220,7 @@ struct RouterActor {
 
     assignments: BTreeMap<Ipv4Addr, IpAssignment>,
     candidates: BTreeMap<(Ipv4Addr, EndpointId), IpCandidate>,
+    doc_peers_tx: watch::Sender<Vec<EndpointAddr>>,
 }
 
 #[derive(Debug)]
@@ -233,12 +237,12 @@ async fn handle_doc_entry(
     updates: &tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>,
     pending: &mut HashMap<iroh_blobs::Hash, Vec<Entry>>,
     download_expected: bool,
-) {
+) -> bool {
     let key = match std::str::from_utf8(entry.key()) {
         Ok(k) => k,
         Err(e) => {
             warn!("Invalid entry key utf8: {}", e);
-            return;
+            return false;
         }
     };
 
@@ -261,7 +265,7 @@ async fn handle_doc_entry(
                 updates.send(DocCacheUpdate::RemoveCandidate(ip, eid)).ok();
             }
         }
-        return;
+        return false;
     }
 
     let val_bytes = match blobs.get_bytes(entry.content_hash()).await {
@@ -269,15 +273,17 @@ async fn handle_doc_entry(
             debug!("Blob found for entry key {}", entry.content_hash());
             b
         }
-        Err(_) => {
+        Err(e) => {
             if download_expected {
                 warn!(
-                    "Blob not found for entry key {}, deferring processing",
-                    entry.content_hash()
+                    "Blob not found for entry key {} ({}), deferring processing",
+                    entry.content_hash(),
+                    e
                 );
             }
             pending.entry(entry.content_hash()).or_default().push(entry);
-            return;
+            let err_str = e.to_string();
+            return err_str.contains("LeafHashMismatch");
         }
     };
 
@@ -299,11 +305,22 @@ async fn handle_doc_entry(
             Err(e) => warn!("Failed to deserialize candidate: {}", e),
         }
     }
+    false
+}
+
+async fn maybe_resync_doc(doc: &Doc, peers_rx: &watch::Receiver<Vec<EndpointAddr>>) {
+    let peers = peers_rx.borrow().clone();
+    if !peers.is_empty()
+        && let Err(e) = doc.start_sync(peers).await
+    {
+        warn!("Failed to resync doc for pending blobs: {}", e);
+    }
 }
 
 async fn run_doc_worker(
     doc: Doc,
     blobs: MemStore,
+    doc_peers_rx: watch::Receiver<Vec<EndpointAddr>>,
     updates: tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>,
 ) {
     let mut pending_blobs: HashMap<iroh_blobs::Hash, Vec<Entry>> = HashMap::new();
@@ -312,7 +329,11 @@ async fn run_doc_worker(
         Ok(stream) => {
             let entries = stream.collect::<Vec<_>>().await;
             for entry in entries.into_iter().flatten() {
-                handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, true).await;
+                let needs_resync =
+                    handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, true).await;
+                if needs_resync {
+                    maybe_resync_doc(&doc, &doc_peers_rx).await;
+                }
             }
         }
         Err(e) => warn!("Failed to populate cache: {}", e),
@@ -331,13 +352,43 @@ async fn run_doc_worker(
             Ok(e) => match e {
                 iroh_docs::engine::LiveEvent::InsertLocal { entry }
                 | iroh_docs::engine::LiveEvent::InsertRemote { entry, .. } => {
-                    handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, false).await;
+                    let needs_resync =
+                        handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, false).await;
+                    if needs_resync {
+                        maybe_resync_doc(&doc, &doc_peers_rx).await;
+                    }
                 }
                 iroh_docs::engine::LiveEvent::ContentReady { hash } => {
                     if let Some(entries) = pending_blobs.remove(&hash) {
                         for entry in entries {
-                            handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, true)
+                            let needs_resync =
+                                handle_doc_entry(entry, &blobs, &updates, &mut pending_blobs, true)
+                                    .await;
+                            if needs_resync {
+                                maybe_resync_doc(&doc, &doc_peers_rx).await;
+                            }
+                        }
+                    }
+                }
+                iroh_docs::engine::LiveEvent::PendingContentReady => {
+                    if !pending_blobs.is_empty() {
+                        maybe_resync_doc(&doc, &doc_peers_rx).await;
+
+                        let pending = std::mem::take(&mut pending_blobs);
+                        for (_hash, entries) in pending {
+                            for entry in entries {
+                                let needs_resync = handle_doc_entry(
+                                    entry,
+                                    &blobs,
+                                    &updates,
+                                    &mut pending_blobs,
+                                    true,
+                                )
                                 .await;
+                                if needs_resync {
+                                    maybe_resync_doc(&doc, &doc_peers_rx).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -424,8 +475,9 @@ impl Actor<anyhow::Error> for RouterActor {
         let (doc_update_tx, mut doc_update_rx) = tokio::sync::mpsc::unbounded_channel();
         let doc = self.doc.clone();
         let blobs = self.blobs.clone();
+        let doc_peers_rx = self.doc_peers_tx.subscribe();
         tokio::spawn(async move {
-            run_doc_worker(doc, blobs, doc_update_tx).await;
+            run_doc_worker(doc, blobs, doc_peers_rx, doc_update_tx).await;
         });
         loop {
             tokio::select! {
@@ -447,6 +499,12 @@ impl Actor<anyhow::Error> for RouterActor {
                         }
                         Err(e) => warn!("Gossip monitor stream error: {:?}", e),
                     }
+                    let peers = self
+                        .gossip_monitor
+                        .neighbors()
+                        .map(EndpointAddr::new)
+                        .collect::<Vec<_>>();
+                    let _ = self.doc_peers_tx.send(peers);
                 }
 
                 // advance ip state machine
