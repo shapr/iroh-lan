@@ -197,7 +197,7 @@ impl Actor<anyhow::Error> for NetworkActor {
         cache_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         debug!("NetworkActor started");
-
+        
         loop {
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => {

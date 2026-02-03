@@ -1,5 +1,5 @@
 use actor_helper::{Action, Handle, act, act_ok};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use iroh::{
     EndpointId,
     endpoint::{Connection, VarInt},
@@ -259,14 +259,20 @@ impl DirectActor {
             }
             Entry::Vacant(entry) => {
                 info!("No active connection to {}, initiating new connection", to);
-                let conn =
-                    Conn::connect(self.endpoint.clone(), to, self.direct_connect_tx.clone()).await;
+                
+                if self.endpoint.id() > to {
+                    let conn =
+                        Conn::connect(self.endpoint.clone(), to, self.direct_connect_tx.clone()).await;
 
-                if let Err(e) = conn.write(pkg).await {
-                    error!("Failed to write packet to new connection {}: {}", to, e);
-                    return Err(e);
+                    if let Err(e) = conn.write(pkg).await {
+                        error!("Failed to write packet to new connection {}: {}", to, e);
+                        return Err(e);
+                    }
+                    entry.insert(conn);
+                } else {
+                    warn!("no connection yet, prefer incoming");
+                    bail!("no connection yet, prefer incoming")
                 }
-                entry.insert(conn);
             }
         }
 
@@ -275,7 +281,6 @@ impl DirectActor {
 
     async fn ensure_connection(&mut self, to: EndpointId) -> Result<()> {
         if self.endpoint.id() > to {
-            debug!("Skipping proactive connection to {} (prefer incoming)", to);
             return Ok(());
         }
         if self.peers.contains_key(&to) {
