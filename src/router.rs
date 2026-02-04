@@ -12,9 +12,9 @@ use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use iroh_blobs::{api::downloader::Downloader, store::mem::MemStore};
 use iroh_docs::{AuthorId, Entry, NamespaceSecret, api::Doc, protocol::Docs, store::Query};
-use tokio::sync::watch;
+use tokio::{sync::watch, time::timeout};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::{
     api::{GossipReceiver, GossipSender},
@@ -325,8 +325,16 @@ async fn handle_doc_entry(
                     hash, e
                 );
 
-                if let Err(err) = downloader.download(hash, peer_ids.clone()).await {
-                    warn!("[Doc] Failed to download pending blob {}: {}", hash, err);
+                let download_res = timeout(
+                    Duration::from_secs(5),
+                    downloader.download(hash, peer_ids.clone()),
+                )
+                .await;
+                if matches!(download_res, Err(_) | Ok(Err(_))) {
+                    warn!(
+                        "[Doc] Failed to download pending blob {}: {:?}",
+                        hash, download_res
+                    );
                     return true;
                 }
                 if let Ok(b) = blobs.get_bytes(hash).await {
@@ -857,7 +865,7 @@ impl RouterActor {
     }
 
     // Assigned IPs
-    fn read_ip_assignment(&self, ip: Ipv4Addr) -> Result<IpAssignment> {
+    fn read_ip_assignment(&self, ip: Ipv4Addr) -> Result<Option<IpAssignment>> {
         if self
             .pending_assignments
             .iter()
@@ -882,12 +890,11 @@ impl RouterActor {
             );
             anyhow::bail!("ip is already assigned (pending)");
         }
-        self.assignments
+        Ok(self.assignments
             .iter()
             .filter(|(_, (assignment, _))| !assignment.is_stale())
             .find(|(key, _)| *key == &ip)
-            .map(|(_, (value, _))| value.clone())
-            .context("no assignment found")
+            .map(|(_, (value, _))| value.clone()))
     }
 
     // Candidate IPs
@@ -931,7 +938,7 @@ impl RouterActor {
     async fn write_ip_assignment(&mut self, ip: Ipv4Addr, endpoint_id: EndpointId) -> Result<()> {
         info!("Attempting to assign IP {} to {}", ip, endpoint_id);
 
-        let existing_assignment = self.read_ip_assignment(ip).ok();
+        let existing_assignment = self.read_ip_assignment(ip)?;
 
         if let Some(existing) = &existing_assignment {
             if existing.endpoint_id != endpoint_id {
@@ -1006,7 +1013,7 @@ impl RouterActor {
         endpoint_id: EndpointId,
     ) -> Result<IpCandidate> {
         // already assigned? don't write
-        if self.read_ip_assignment(ip).is_ok() {
+        if self.read_ip_assignment(ip)?.is_some() {
             anyhow::bail!("ip assignment already assigned");
         }
 
@@ -1068,7 +1075,9 @@ impl RouterActor {
     }
 
     async fn get_endpoint_id_from_ip(&mut self, ip: Ipv4Addr) -> Result<EndpointId> {
-        self.read_ip_assignment(ip).map(|a| a.endpoint_id)
+        self.read_ip_assignment(ip)?
+            .map(|a| a.endpoint_id)
+            .ok_or_else(|| anyhow::anyhow!("no endpoint_id found for ip"))
     }
 
     async fn get_ip_from_endpoint_id(&mut self, endpoint_id: EndpointId) -> Result<Ipv4Addr> {
@@ -1144,9 +1153,9 @@ impl RouterActor {
                 // Wait 2 seconds to ensure propagation
                 if start_time.elapsed() > Duration::from_secs(2) {
                     trace!("Verifying IP assignment logic for {}", ip);
-                    let assignment = self.read_ip_assignment(ip);
+                    let assignment = self.read_ip_assignment(ip)?;
                     match assignment {
-                        Ok(a) if a.endpoint_id == self.endpoint_id => {
+                        Some(a) if a.endpoint_id == self.endpoint_id => {
                             info!("Verified ownership of IP: {}", ip);
                             self.my_ip = RouterIp::AssignedIp(ip);
                         }
@@ -1162,8 +1171,8 @@ impl RouterActor {
                 Ok(false)
             }
             RouterIp::AssignedIp(my_ip) => {
-                match self.read_ip_assignment(my_ip) {
-                    Ok(ip_assignment) => {
+                match self.read_ip_assignment(my_ip)? {
+                    Some(ip_assignment) => {
                         if ip_assignment.endpoint_id != self.endpoint_id {
                             self.my_ip = RouterIp::NoIp;
                             warn!(
@@ -1185,7 +1194,7 @@ impl RouterActor {
                             Ok(true)
                         }
                     }
-                    Err(_) => {
+                    None => {
                         self.my_ip = RouterIp::NoIp;
                         warn!("Assignment lost/deleted for {}. Restarting.", my_ip);
                         Ok(false)
