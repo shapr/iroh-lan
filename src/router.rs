@@ -227,21 +227,21 @@ struct RouterActor {
 
     pub my_ip: RouterIp,
 
-    assignments: BTreeMap<Ipv4Addr, IpAssignment>,
-    candidates: BTreeMap<(Ipv4Addr, EndpointId), IpCandidate>,
-    pending_assignments: Vec<iroh_blobs::Hash>,
-    pending_candidates: Vec<iroh_blobs::Hash>,
+    assignments: BTreeMap<Ipv4Addr, (IpAssignment, Entry)>,
+    candidates: BTreeMap<(Ipv4Addr, EndpointId), (IpCandidate, Entry)>,
+    pending_assignments: Vec<Entry>,
+    pending_candidates: Vec<Entry>,
     doc_peers_tx: watch::Sender<Vec<EndpointAddr>>,
 }
 
 #[derive(Debug)]
 enum DocCacheUpdate {
-    UpsertAssignment(IpAssignment, iroh_blobs::Hash),
-    RemoveAssignment(Ipv4Addr, iroh_blobs::Hash),
-    UpsertCandidate(IpCandidate, iroh_blobs::Hash),
-    RemoveCandidate(Ipv4Addr, EndpointId, iroh_blobs::Hash),
-    PendingAssignment(iroh_blobs::Hash),
-    PendingCandidate(iroh_blobs::Hash),
+    UpsertAssignment(IpAssignment, Entry),
+    RemoveAssignment(Ipv4Addr, Entry),
+    UpsertCandidate(IpCandidate, Entry),
+    RemoveCandidate(Ipv4Addr, EndpointId, Entry),
+    PendingAssignment(Entry),
+    PendingCandidate(Entry),
 }
 
 async fn handle_doc_entry(
@@ -266,11 +266,11 @@ async fn handle_doc_entry(
 
     if key.starts_with(&assigned_prefix) {
         updates
-            .send(DocCacheUpdate::PendingAssignment(entry.content_hash()))
+            .send(DocCacheUpdate::PendingAssignment(entry.clone()))
             .ok();
     } else if key.starts_with(&candidate_prefix) {
         updates
-            .send(DocCacheUpdate::PendingCandidate(entry.content_hash()))
+            .send(DocCacheUpdate::PendingCandidate(entry.clone()))
             .ok();
     }
 
@@ -285,7 +285,7 @@ async fn handle_doc_entry(
                 && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
             {
                 updates
-                    .send(DocCacheUpdate::RemoveAssignment(ip, entry.content_hash()))
+                    .send(DocCacheUpdate::RemoveAssignment(ip, entry.clone()))
                     .ok();
             }
         } else if key.starts_with(&candidate_prefix) {
@@ -295,14 +295,14 @@ async fn handle_doc_entry(
                     (parts[3].parse::<Ipv4Addr>(), parts[4].parse::<EndpointId>())
             {
                 updates
-                    .send(DocCacheUpdate::RemoveCandidate(
-                        ip,
-                        eid,
-                        entry.content_hash(),
-                    ))
+                    .send(DocCacheUpdate::RemoveCandidate(ip, eid, entry.clone()))
                     .ok();
             }
         }
+        warn!(
+            "[Doc] Entry has zero content length, skipping blob fetch for key {}",
+            key
+        );
         return false;
     }
 
@@ -315,24 +315,32 @@ async fn handle_doc_entry(
             let hash = entry.content_hash();
             pending.entry(hash).or_default().push(entry.clone());
             let err_str = e.to_string();
-            debug!("Blob get_bytes failed for {}: {}", hash, err_str);
+            debug!("[Doc] Blob get_bytes failed for {}: {}", hash, err_str);
             if download_expected {
                 warn!(
-                    "[Router] Blob not found for entry key {} ({:?}), deferring processing",
+                    "[Doc] Blob not found for entry key {} ({:?}), deferring processing",
                     hash, e
                 );
 
                 if let Err(err) = downloader.download(hash, peer_ids.clone()).await {
-                    warn!("Failed to download pending blob {}: {}", hash, err);
+                    warn!("[Doc] Failed to download pending blob {}: {}", hash, err);
                     return true;
                 }
                 if let Ok(b) = blobs.get_bytes(hash).await {
-                    debug!("Successfully downloaded pending blob {}", hash);
+                    debug!("[Doc] Successfully downloaded pending blob {}", hash);
                     b
                 } else {
+                    warn!(
+                        "[Doc] Blob still not found for entry key {} after download attempt, skipping processing",
+                        hash
+                    );
                     return true;
                 }
             } else {
+                warn!(
+                    "[Doc] Blob not found for entry key {} ({:?}), skipping processing",
+                    hash, e
+                );
                 return false;
             }
         }
@@ -345,7 +353,7 @@ async fn handle_doc_entry(
         match postcard::from_bytes::<IpAssignment>(&val_bytes) {
             Ok(val) => {
                 updates
-                    .send(DocCacheUpdate::UpsertAssignment(val, entry.content_hash()))
+                    .send(DocCacheUpdate::UpsertAssignment(val, entry.clone()))
                     .ok();
             }
             Err(e) => warn!("Failed to deserialize assignment: {}", e),
@@ -354,11 +362,16 @@ async fn handle_doc_entry(
         match postcard::from_bytes::<IpCandidate>(&val_bytes) {
             Ok(val) => {
                 updates
-                    .send(DocCacheUpdate::UpsertCandidate(val, entry.content_hash()))
+                    .send(DocCacheUpdate::UpsertCandidate(val, entry.clone()))
                     .ok();
             }
             Err(e) => warn!("Failed to deserialize candidate: {}", e),
         }
+    } else {
+        warn!(
+            "[Doc] Unknown entry key prefix, skipping processing for key {}",
+            key
+        );
     }
     false
 }
@@ -386,13 +399,13 @@ fn schedule_resync_doc(
     tokio::spawn(async move {
         let peers = peers_rx.borrow().clone();
         if !peers.is_empty() {
-            let res = tokio::time::timeout(Duration::from_secs(5), async {
+            let res = tokio::time::timeout(Duration::from_secs(30), async {
                 if let Err(e) = doc.start_sync(peers.clone()).await {
-                    warn!("Failed to start doc sync for pending blobs: {}", e);
+                    warn!("[Doc][resync] Failed to start doc sync for pending blobs: {}", e);
                     return Err(anyhow::anyhow!(e));
                 }
                 if let Err(e) = blobs.sync_db().await {
-                    warn!("Failed to sync blobs db for pending blobs: {}", e);
+                    warn!("[Doc][resync] Failed to sync blobs db for pending blobs: {}", e);
                     return Err(anyhow::anyhow!(e));
                 }
 
@@ -400,29 +413,32 @@ fn schedule_resync_doc(
                 let peer_ids: Vec<_> = peers.iter().map(|e| e.id).collect();
                 for hash in pending_hashes {
                     if let Err(err) = downloader.download(hash, peer_ids.clone()).await {
-                        warn!("Failed to download pending blob {}: {}", hash, err);
+                        warn!("[Doc][resync] Failed to download pending blob {}: {}", hash, err);
                         anyhow::bail!(err)
                     }
                     if let Err(err) = blobs.get_bytes(hash).await {
                         warn!(
-                            "Failed to get bytes for pending blob {} after download: {}",
+                            "[Doc][resync] Failed to get bytes for pending blob {} after download: {}",
                             hash, err
                         );
                         anyhow::bail!(err)
                     } else {
-                        debug!("Successfully downloaded pending blob {}", hash);
+                        debug!("[Doc][resync] Successfully downloaded pending blob {}", hash);
                     }
                 }
                 Ok(())
             })
             .await;
             if let Err(e) = res {
-                warn!("Doc resync timed out: {}", e);
+                warn!("[Doc][resync] Doc resync timed out: {}", e);
             } else if let Ok(Err(e)) = res {
-                warn!("Failed to resync doc for pending blobs: {}", e);
+                warn!(
+                    "[Doc][resync] Failed to resync doc for pending blobs: {}",
+                    e
+                );
             }
         } else {
-            tokio::time::sleep(Duration::from_millis(2000)).await;
+            warn!("[Doc][resync] No peers available for doc resync, skipping resync");
         }
         resync_in_flight.store(false, Ordering::SeqCst);
     });
@@ -621,12 +637,12 @@ impl Router {
             .call(act!(actor => async move {
                 let mut map: BTreeMap<EndpointId, Option<Ipv4Addr>> = BTreeMap::new();
 
-                let assignments = actor.read_all_ip_assignments();
+                let assignments = actor.read_all_ip_assignments()?;
                 for a in assignments {
                     map.insert(a.endpoint_id, Some(a.ip));
                 }
 
-                let cands = actor.read_all_ip_candidates();
+                let cands = actor.read_all_ip_candidates()?;
                 for c in cands {
                     map.entry(c.endpoint_id).or_insert(None);
                 }
@@ -704,20 +720,20 @@ impl Actor<anyhow::Error> for RouterActor {
 
                 Some(update) = doc_update_rx.recv() => {
                     match update {
-                        DocCacheUpdate::UpsertAssignment(val, hash) => {
-                            self.pending_assignments.retain(|h| *h != hash);
-                            self.assignments.insert(val.ip, val);
+                        DocCacheUpdate::UpsertAssignment(val, entry) => {
+                            self.pending_assignments.retain(|h| h.content_hash() != entry.content_hash() && !is_stale(h.record().timestamp(), RouterActor::ASSIGNMENT_STALE_SECS));
+                            self.assignments.insert(val.ip, (val, entry));
                         }
-                        DocCacheUpdate::RemoveAssignment(ip, hash) => {
-                            self.pending_assignments.retain(|h| *h != hash);
+                        DocCacheUpdate::RemoveAssignment(ip, entry) => {
+                            self.pending_assignments.retain(|h| h.content_hash() != entry.content_hash() && !is_stale(h.record().timestamp(), RouterActor::ASSIGNMENT_STALE_SECS));
                             self.assignments.remove(&ip);
                         }
-                        DocCacheUpdate::UpsertCandidate(val, hash) => {
-                            self.pending_candidates.retain(|h| *h != hash);
-                            self.candidates.insert((val.ip, val.endpoint_id), val);
+                        DocCacheUpdate::UpsertCandidate(val, entry) => {
+                            self.pending_candidates.retain(|h| h.content_hash() != entry.content_hash() && !is_stale(h.record().timestamp(), RouterActor::CANDIDATE_STALE_SECS));
+                            self.candidates.insert((val.ip, val.endpoint_id), (val, entry));
                         }
-                        DocCacheUpdate::RemoveCandidate(ip, endpoint_id, hash) => {
-                            self.pending_candidates.retain(|h| *h != hash);
+                        DocCacheUpdate::RemoveCandidate(ip, endpoint_id, entry) => {
+                            self.pending_candidates.retain(|h| h.content_hash() != entry.content_hash() && !is_stale(h.record().timestamp(), RouterActor::CANDIDATE_STALE_SECS));
                             self.candidates.remove(&(ip, endpoint_id));
                         }
                         DocCacheUpdate::PendingAssignment(hash) => {
@@ -755,14 +771,18 @@ pub struct IpCandidate {
 
 impl IpAssignment {
     pub fn is_stale(&self) -> bool {
-        current_time().saturating_sub(self.last_updated) > RouterActor::ASSIGNMENT_STALE_SECS
+        is_stale(self.last_updated, RouterActor::ASSIGNMENT_STALE_SECS)
     }
 }
 
 impl IpCandidate {
     pub fn is_stale(&self) -> bool {
-        current_time().saturating_sub(self.last_updated) > RouterActor::CANDIDATE_STALE_SECS
+        is_stale(self.last_updated, RouterActor::CANDIDATE_STALE_SECS)
     }
+}
+
+fn is_stale(last_updated: u64, stale_secs: u64) -> bool {
+    current_time().saturating_sub(last_updated) > stale_secs
 }
 
 fn key_ip_assigned(ip: Ipv4Addr) -> String {
@@ -785,40 +805,120 @@ impl RouterActor {
     const ASSIGNMENT_STALE_SECS: u64 = 300;
     const CANDIDATE_STALE_SECS: u64 = 60;
 
-    fn read_all_ip_assignments(&self) -> Vec<IpAssignment> {
-        self.assignments
+    fn read_all_ip_assignments(&self) -> Result<Vec<IpAssignment>> {
+        if self
+            .pending_assignments
+            .iter()
+            .filter(|entry| {
+                !is_stale(
+                    entry.record().timestamp(),
+                    RouterActor::ASSIGNMENT_STALE_SECS,
+                )
+            })
+            .count()
+            > 0
+        {
+            warn!("[Doc] read_all_ip_assignments: there are pending blob assignments",);
+            anyhow::bail!("ip is already assigned (pending)");
+        }
+        Ok(self
+            .assignments
             .values()
-            .filter(|assignment| !assignment.is_stale())
-            .cloned()
-            .collect()
+            .filter(|(assignment, _)| !assignment.is_stale())
+            .map(|(assignment, _)| assignment.clone())
+            .collect::<Vec<_>>())
     }
 
-    fn read_all_ip_candidates(&self) -> Vec<IpCandidate> {
-        self.candidates
+    fn read_all_ip_candidates(&self) -> Result<Vec<IpCandidate>> {
+        if self
+            .pending_assignments
+            .iter()
+            .filter(|entry| {
+                !is_stale(
+                    entry.record().timestamp(),
+                    RouterActor::CANDIDATE_STALE_SECS,
+                )
+            })
+            .count()
+            > 0
+        {
+            warn!("[Doc] read_all_ip_candidates: there are pending blob assignments",);
+            anyhow::bail!("ip is already assigned (pending)");
+        }
+        Ok(self
+            .candidates
             .values()
-            .filter(|candidate| !candidate.is_stale())
-            .cloned()
-            .collect()
+            .filter(|(candidate, _)| !candidate.is_stale())
+            .map(|(candidate, _)| candidate.clone())
+            .collect::<Vec<_>>())
     }
 
     // Assigned IPs
     fn read_ip_assignment(&self, ip: Ipv4Addr) -> Result<IpAssignment> {
+        if self
+            .pending_assignments
+            .iter()
+            .filter(|entry| {
+                !is_stale(
+                    entry.record().timestamp(),
+                    RouterActor::ASSIGNMENT_STALE_SECS,
+                )
+            })
+            .any(|entry| {
+                if let Some(key_str) = std::str::from_utf8(entry.key()).ok()
+                    && key_str == key_ip_assigned(ip)
+                {
+                    return true;
+                }
+                false
+            })
+        {
+            warn!(
+                "[Doc] read_ip_assignment: ip {} has pending blob assignments",
+                ip
+            );
+            anyhow::bail!("ip is already assigned (pending)");
+        }
         self.assignments
             .iter()
-            .filter(|(_, assignment)| !assignment.is_stale())
+            .filter(|(_, (assignment, _))| !assignment.is_stale())
             .find(|(key, _)| *key == &ip)
-            .map(|(_, value)| value.clone())
+            .map(|(_, (value, _))| value.clone())
             .context("no assignment found")
     }
 
     // Candidate IPs
     fn read_ip_candidates(&self, ip: Ipv4Addr) -> Result<Vec<IpCandidate>> {
+        if self
+            .pending_assignments
+            .iter()
+            .filter(|entry| {
+                !is_stale(
+                    entry.record().timestamp(),
+                    RouterActor::CANDIDATE_STALE_SECS,
+                )
+            })
+            .any(|entry| {
+                if let Some(key_str) = std::str::from_utf8(entry.key()).ok()
+                    && key_str == key_ip_assigned(ip)
+                {
+                    return true;
+                }
+                false
+            })
+        {
+            warn!(
+                "[Doc] read_ip_candidates: ip {} has pending blob assignments",
+                ip
+            );
+            anyhow::bail!("ip is already assigned (pending)");
+        }
         let filtered = self
             .candidates
             .values()
-            .filter(|c| c.ip == ip)
-            .filter(|candidate| !candidate.is_stale())
-            .cloned()
+            .filter(|(c, _)| c.ip == ip)
+            .filter(|(candidate, _)| !candidate.is_stale())
+            .map(|(candidate, _)| candidate.clone())
             .collect::<Vec<_>>();
         debug!("candidates for {ip}: {}", filtered.len());
         Ok(filtered)
@@ -969,7 +1069,7 @@ impl RouterActor {
     }
 
     async fn get_ip_from_endpoint_id(&mut self, endpoint_id: EndpointId) -> Result<Ipv4Addr> {
-        self.read_all_ip_assignments()
+        self.read_all_ip_assignments()?
             .iter()
             .find(|assignment| assignment.endpoint_id == endpoint_id)
             .map(|a| a.ip)
@@ -979,15 +1079,6 @@ impl RouterActor {
 
 impl RouterActor {
     async fn advance_ip_state(&mut self) -> Result<bool> {
-        self.blobs.sync_db().await.ok();
-        if !self.pending_assignments.is_empty() || !self.pending_candidates.is_empty() {
-            info!(
-                "[Router] Deferring IP state advancement; pending blobs (assignments: {}, candidates: {})",
-                self.pending_assignments.len(),
-                self.pending_candidates.len()
-            );
-            return Ok(false);
-        }
         trace!("Advancing IP state. Current: {:?}", self.my_ip);
         match self.my_ip.clone() {
             RouterIp::NoIp => {
@@ -1102,8 +1193,8 @@ impl RouterActor {
     }
 
     async fn get_next_ip(&mut self) -> Result<Ipv4Addr> {
-        let all_assigned = self.read_all_ip_assignments();
-        let all_candidates = self.read_all_ip_candidates();
+        let all_assigned = self.read_all_ip_assignments()?;
+        let all_candidates = self.read_all_ip_candidates()?;
 
         let mut used_ips = all_assigned
             .iter()
