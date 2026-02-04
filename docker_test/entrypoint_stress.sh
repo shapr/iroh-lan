@@ -82,7 +82,7 @@ wait_for_signal() {
 
 run_iperf_once() {
     local host="$1"
-    iperf3 -c "$host" -t 120 -l 4000 --connect-timeout 30000
+    iperf3 -c "$host" -t 10 -l 4000 --connect-timeout 30000
 }
 
 clear_signal() {

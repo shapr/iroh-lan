@@ -155,18 +155,21 @@ impl Builder {
             })
             .await?;
 
-        let wait_start = tokio::time::Instant::now();
         while match doc.get_sync_peers().await {
             Ok(Some(peers)) => peers.is_empty(),
             Ok(None) => true,
             Err(_) => true,
         } {
-            if wait_start.elapsed() > Duration::from_secs(30) {
-                warn!("Doc sync peers not available yet; continuing without peers");
-                break;
-            }
+            doc.start_sync(
+                gossip_receiver
+                    .neighbors()
+                    .map(EndpointAddr::new)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .ok();
             debug!("Waiting for doc to be ready...");
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
 
         let (api, rx) = Handle::channel();
