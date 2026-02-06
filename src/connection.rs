@@ -259,7 +259,8 @@ impl Actor<anyhow::Error> for ConnActor {
                         warn!("[PROBE-QUEUE] High Queue Len: {}", q_len);
                     }
                     debug!(
-                        "Conn stats: state={:?} last_rx={:?} last_tx={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
+                        "Conn stats: endpoint_id={} state={:?} last_rx={:?} last_tx={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
+                        self.conn_endpoint_id,
                         self.state,
                         self.last_rx.elapsed(),
                         self.last_tx.elapsed(),
