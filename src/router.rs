@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     net::Ipv4Addr,
     time::Duration,
 };
@@ -21,6 +21,7 @@ use iroh_topic_tracker::{
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
 use actor_helper::{Action, Actor, Handle, act, act_ok};
@@ -133,6 +134,7 @@ impl Builder {
             }
         };
 
+        info!("Joined topic with hash: {:x?}", topic_hash);
         let doc_peers = gossip_receiver
             .neighbors()
             .map(EndpointAddr::new)
@@ -154,14 +156,29 @@ impl Builder {
             Ok(None) => true,
             Err(_) => true,
         } {
-            doc.start_sync(
-                gossip_receiver
-                    .neighbors()
-                    .map(EndpointAddr::new)
-                    .collect::<Vec<_>>(),
-            )
-            .await
-            .ok();
+            if let Ok(Some(peers)) = doc.get_sync_peers().await
+                && peers
+                    != gossip_receiver
+                        .neighbors()
+                        .map(|a| *a.as_bytes())
+                        .collect::<Vec<_>>()
+            {
+                doc.start_sync(
+                    gossip_receiver
+                        .neighbors()
+                        .map(EndpointAddr::new)
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .ok();
+                debug!(
+                    "Doc sync peers updated: {:?}",
+                    gossip_receiver
+                        .neighbors()
+                        .map(EndpointAddr::new)
+                        .collect::<Vec<_>>()
+                );
+            }
             debug!("Waiting for doc to be ready...");
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
@@ -182,6 +199,7 @@ impl Builder {
                 my_ip: RouterIp::NoIp,
                 assignments: BTreeMap::new(),
                 candidates: BTreeMap::new(),
+                startup_entries: BTreeSet::new(),
             };
             router_actor.run().await
         });
@@ -223,12 +241,14 @@ struct RouterActor {
 
     assignments: BTreeMap<Ipv4Addr, IpAssignment>,
     candidates: BTreeMap<Ipv4Addr, BTreeMap<EndpointId, IpCandidate>>,
+    startup_entries: BTreeSet<AuthorId>,
 }
 
 #[derive(Debug)]
 enum DocCacheUpdate {
-    UpsertAssignment(IpAssignment),
-    UpsertCandidate(IpCandidate),
+    Assignment(IpAssignment),
+    Candidate(IpCandidate),
+    Startup(AuthorId),
 }
 
 async fn handle_doc_entry(
@@ -245,6 +265,7 @@ async fn handle_doc_entry(
 
     let assigned_prefix = key_assigned_ip();
     let candidate_prefix = key_candidate_ip_prefix();
+    let startup_prefix = key_startup_prefix();
 
     // Assignment
     if key.starts_with(&assigned_prefix) {
@@ -255,7 +276,7 @@ async fn handle_doc_entry(
                 return Err(e);
             }
         };
-        updates.send(DocCacheUpdate::UpsertAssignment(ip_assignment))?;
+        updates.send(DocCacheUpdate::Assignment(ip_assignment))?;
         return Ok(());
     }
     // Candidate
@@ -267,7 +288,17 @@ async fn handle_doc_entry(
                 return Err(e);
             }
         };
-        updates.send(DocCacheUpdate::UpsertCandidate(ip_candidate))?;
+        updates.send(DocCacheUpdate::Candidate(ip_candidate))?;
+        return Ok(());
+    } else if key.starts_with(&startup_prefix) {
+        let author_id = match decode_author_id_from_startup(key) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("Failed to decode author id from startup key {}: {}", key, e);
+                return Err(e);
+            }
+        };
+        updates.send(DocCacheUpdate::Startup(author_id))?;
         return Ok(());
     }
 
@@ -278,7 +309,37 @@ async fn handle_doc_entry(
     Err(anyhow::anyhow!("Unhandled doc entry"))
 }
 
-async fn run_doc_worker(doc: Doc, updates: tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>) {
+async fn run_doc_worker(
+    author_id: AuthorId,
+    doc: Doc,
+    updates: tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>,
+) {
+    doc.set_bytes(
+        author_id,
+        format!("{}{}", key_startup_prefix(), author_id),
+        author_id.to_string(),
+    )
+    .await
+    .ok();
+
+    loop {
+        match doc.get_many(Query::key_prefix(key_startup_prefix())).await {
+            Ok(it) => {
+                let count = it.count().await;
+                if count >= 2 {
+                    break;
+                } else {
+                    warn!(
+                        "Doc not ready yet, {} entries found with startup prefix",
+                        count
+                    );
+                }
+            }
+            Err(e) => warn!("Failed to query doc for startup entries: {}", e),
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+
     match doc.get_many(Query::all()).await {
         Ok(stream) => {
             let entries = stream.collect::<Vec<_>>().await;
@@ -361,12 +422,12 @@ impl Router {
             .call(act!(actor => async move {
                 let mut map: BTreeMap<EndpointId, Option<Ipv4Addr>> = BTreeMap::new();
 
-                let assignments = actor.read_all_ip_assignments()?;
+                let assignments = actor.read_all_ip_assignments(true)?;
                 for a in assignments {
                     map.insert(a.endpoint_id, Some(a.ip));
                 }
 
-                let cands = actor.read_all_ip_candidates()?;
+                let cands = actor.read_all_ip_candidates(true)?;
                 for c in cands {
                     map.entry(c.endpoint_id).or_insert(None);
                 }
@@ -394,8 +455,9 @@ impl Actor<anyhow::Error> for RouterActor {
 
         let (doc_update_tx, mut doc_update_rx) = tokio::sync::mpsc::unbounded_channel();
         let doc = self.doc.clone();
+        let author_id = self.author_id;
         tokio::spawn(async move {
-            run_doc_worker(doc, doc_update_tx).await;
+            run_doc_worker(author_id, doc, doc_update_tx).await;
         });
         loop {
             tokio::select! {
@@ -418,6 +480,10 @@ impl Actor<anyhow::Error> for RouterActor {
                 // advance ip state machine
                 _ = ip_tick.tick() => {
                     trace!("IP tick");
+                    if self.startup_entries.len() < 2 {
+                        trace!("Not advancing IP state, waiting for startup entries. Current count: {}", self.startup_entries.len());
+                        continue;
+                    }
                     match self.advance_ip_state().await {
                         Ok(_) => if self.my_ip != last_ip_state {
                             info!("Router IP state changed: {:?} -> {:?}", last_ip_state, self.my_ip);
@@ -427,14 +493,17 @@ impl Actor<anyhow::Error> for RouterActor {
                             warn!("Error advancing IP state: {}", e);
                         }
                     }
+
+                    trace!("Doc peer sync");
+                    // Add doc sync or direct gossip spawn
                 }
 
                 Some(update) = doc_update_rx.recv() => {
                     match update {
-                        DocCacheUpdate::UpsertAssignment(ip_assignment) => {
+                        DocCacheUpdate::Assignment(ip_assignment) => {
                             self.assignments.insert(ip_assignment.ip, ip_assignment);
                         }
-                        DocCacheUpdate::UpsertCandidate(ip_candidate) => {
+                        DocCacheUpdate::Candidate(ip_candidate) => {
                             match self.candidates.get_mut(&ip_candidate.ip) {
                                 Some(cands) => {
                                     cands.insert(ip_candidate.endpoint_id, ip_candidate);
@@ -445,6 +514,9 @@ impl Actor<anyhow::Error> for RouterActor {
                                     self.candidates.insert(ip_candidate.ip, map);
                                 },
                             }
+                        }
+                        DocCacheUpdate::Startup(author_id) => {
+                            self.startup_entries.insert(author_id);
                         }
                     }
                 }
@@ -563,39 +635,99 @@ fn encode_ip_candidate(candidate: &IpCandidate) -> String {
     )
 }
 
+fn decode_author_id_from_startup(key: &str) -> Result<AuthorId> {
+    let parts: Vec<&str> = key.split('/').collect();
+    if parts.len() != 3 {
+        warn!(
+            "Invalid key format for startup entry (invalid length): {}",
+            key
+        );
+        anyhow::bail!("Invalid key format for startup entry");
+    }
+    if let Ok(author_id) = parts[2].parse::<AuthorId>() {
+        Ok(author_id)
+    } else {
+        warn!(
+            "Failed to parse AuthorId from startup key (parse failed): {}",
+            key
+        );
+        anyhow::bail!("Invalid key format for startup entry");
+    }
+}
+
 fn key_candidate_ip_prefix() -> String {
     "/candidates/ip/".to_string()
+}
+
+fn key_startup_prefix() -> String {
+    "/startup/".to_string()
 }
 
 impl RouterActor {
     const ASSIGNMENT_STALE_SECS: u64 = 300;
     const CANDIDATE_STALE_SECS: u64 = 60;
+    const IP_RANGES: [(usize, Ipv4Addr); u16::MAX as usize - 2] = {
+        let mut data = [(0, Ipv4Addr::UNSPECIFIED); u16::MAX as usize - 2];
+        let mut order = 2usize;
+        while order < u16::MAX as usize {
+            let octet3 = (order >> 8) as u8;
+            let octet4 = (order & 0xFF) as u8;
+            data[order - 2] = (order, Ipv4Addr::new(172, 30, octet3, octet4));
+            order += 1;
+        }
+        data
+    };
 
-    fn read_all_ip_assignments(&self) -> Result<Vec<IpAssignment>> {
+    fn is_initialized(&self) -> bool {
+        self.startup_entries.len() >= 2
+    }
+
+    fn read_all_ip_assignments(&self, filter_stale: bool) -> Result<Vec<IpAssignment>> {
+        if !self.is_initialized() {
+            warn!(
+                "[Doc] read_all_ip_assignments called before initialized. Startup entries count: {}",
+                self.startup_entries.len()
+            );
+            bail!("[Doc] not initialized yet");
+        }
         Ok(self
             .assignments
             .values()
-            .filter(|assignment| !assignment.is_stale())
+            .filter(|assignment| !filter_stale || !assignment.is_stale())
             .cloned()
             .collect::<Vec<_>>())
     }
 
-    fn read_all_ip_candidates(&self) -> Result<Vec<IpCandidate>> {
+    fn read_all_ip_candidates(&self, filter_stale: bool) -> Result<Vec<IpCandidate>> {
+        if !self.is_initialized() {
+            warn!(
+                "[Doc] read_all_ip_candidates called before initialized. Startup entries count: {}",
+                self.startup_entries.len()
+            );
+            bail!("[Doc] not initialized yet");
+        }
         Ok(self
             .candidates
             .values()
             .flatten()
-            .filter(|(_, candidate)| !candidate.is_stale())
+            .filter(|(_, candidate)| !filter_stale || !candidate.is_stale())
             .map(|(_, candidate)| candidate.clone())
             .collect::<Vec<_>>())
     }
 
     // Assigned IPs
-    fn read_ip_assignment(&self, ip: Ipv4Addr) -> Result<Option<IpAssignment>> {
+    fn read_ip_assignment(&self, ip: Ipv4Addr, filter_stale: bool) -> Result<Option<IpAssignment>> {
+        if !self.is_initialized() {
+            warn!(
+                "[Doc] read_ip_assignment called before initialized. Startup entries count: {}",
+                self.startup_entries.len()
+            );
+            bail!("[Doc] not initialized yet");
+        }
         let mut assignments = self
             .assignments
             .iter()
-            .filter(|(_, assignment)| !assignment.is_stale())
+            .filter(|(_, assignment)| !filter_stale || !assignment.is_stale())
             .map(|(_, assignment)| assignment)
             .collect::<Vec<_>>();
         assignments.sort_by_key(|a| a.last_updated);
@@ -603,11 +735,18 @@ impl RouterActor {
     }
 
     // Candidate IPs
-    fn read_ip_candidates(&self, ip: Ipv4Addr) -> Result<Vec<IpCandidate>> {
+    fn read_ip_candidates(&self, ip: Ipv4Addr, filter_stale: bool) -> Result<Vec<IpCandidate>> {
+        if !self.is_initialized() {
+            warn!(
+                "[Doc] read_ip_candidates called before initialized. Startup entries count: {}",
+                self.startup_entries.len()
+            );
+            bail!("[Doc] not initialized yet");
+        }
         let mut ip_candidates = match self.candidates.get(&ip) {
             Some(candidates) => candidates
                 .values()
-                .filter(|candidate| !candidate.is_stale())
+                .filter(|candidate| !filter_stale || !candidate.is_stale())
                 .cloned()
                 .collect::<Vec<_>>(),
             None => vec![],
@@ -619,9 +758,16 @@ impl RouterActor {
 
     // write ip assigned
     async fn write_ip_assignment(&mut self, ip: Ipv4Addr, endpoint_id: EndpointId) -> Result<()> {
+        if !self.is_initialized() {
+            warn!(
+                "[Doc] write_ip_assignment called before initialized. Startup entries count: {}",
+                self.startup_entries.len()
+            );
+            bail!("[Doc] not initialized yet");
+        }
         info!("Attempting to assign IP {} to {}", ip, endpoint_id);
 
-        let existing_assignment = self.read_ip_assignment(ip)?;
+        let existing_assignment = self.read_ip_assignment(ip, true)?;
 
         if let Some(existing) = &existing_assignment {
             if existing.endpoint_id != endpoint_id {
@@ -629,7 +775,7 @@ impl RouterActor {
             }
         } else {
             // New assignment. check for multiple candidates
-            let candidates = self.read_ip_candidates(ip)?;
+            let candidates = self.read_ip_candidates(ip, true)?;
             if candidates.is_empty() {
                 bail!("no candidates for this ip");
             }
@@ -668,12 +814,19 @@ impl RouterActor {
         ip: Ipv4Addr,
         endpoint_id: EndpointId,
     ) -> Result<IpCandidate> {
+        if !self.is_initialized() {
+            warn!(
+                "[Doc] write_ip_candidate called before initialized. Startup entries count: {}",
+                self.startup_entries.len()
+            );
+            bail!("[Doc] not initialized yet");
+        }
         // already assigned? don't write
-        if self.read_ip_assignment(ip)?.is_some() {
+        if self.read_ip_assignment(ip, true)?.is_some() {
             anyhow::bail!("ip assignment already assigned");
         }
 
-        if let Ok(candidates) = self.read_ip_candidates(ip)
+        if let Ok(candidates) = self.read_ip_candidates(ip, true)
             && !candidates.is_empty()
         {
             anyhow::bail!("ip candidate already exists");
@@ -699,13 +852,13 @@ impl RouterActor {
     }
 
     async fn get_endpoint_id_from_ip(&mut self, ip: Ipv4Addr) -> Result<EndpointId> {
-        self.read_ip_assignment(ip)?
+        self.read_ip_assignment(ip, true)?
             .map(|a| a.endpoint_id)
             .ok_or_else(|| anyhow::anyhow!("no endpoint_id found for ip"))
     }
 
     async fn get_ip_from_endpoint_id(&mut self, endpoint_id: EndpointId) -> Result<Ipv4Addr> {
-        self.read_all_ip_assignments()?
+        self.read_all_ip_assignments(true)?
             .iter()
             .find(|assignment| assignment.endpoint_id == endpoint_id)
             .map(|a| a.ip)
@@ -730,7 +883,7 @@ impl RouterActor {
             RouterIp::AquiringIp(ip_candidate, start_time) => {
                 let elapsed = start_time.elapsed();
 
-                if let Ok(candidates) = self.read_ip_candidates(ip_candidate.ip)
+                if let Ok(candidates) = self.read_ip_candidates(ip_candidate.ip, true)
                     && candidates.iter().any(|c| {
                         c.endpoint_id != self.endpoint_id && self.endpoint_id < c.endpoint_id
                     })
@@ -777,7 +930,7 @@ impl RouterActor {
                 // Wait 2 seconds to ensure propagation
                 if start_time.elapsed() > Duration::from_secs(2) {
                     trace!("Verifying IP assignment logic for {}", ip);
-                    let assignment = self.read_ip_assignment(ip)?;
+                    let assignment = self.read_ip_assignment(ip, true)?;
                     match assignment {
                         Some(a) if a.endpoint_id == self.endpoint_id => {
                             info!("Verified ownership of IP: {}", ip);
@@ -795,7 +948,7 @@ impl RouterActor {
                 Ok(false)
             }
             RouterIp::AssignedIp(my_ip) => {
-                match self.read_ip_assignment(my_ip)? {
+                match self.read_ip_assignment(my_ip, true)? {
                     Some(ip_assignment) => {
                         if ip_assignment.endpoint_id != self.endpoint_id {
                             self.my_ip = RouterIp::NoIp;
@@ -829,37 +982,49 @@ impl RouterActor {
     }
 
     async fn get_next_ip(&mut self) -> Result<Ipv4Addr> {
-        let all_assigned = self.read_all_ip_assignments()?;
-        let all_candidates = self.read_all_ip_candidates()?;
+        let mut next_ip_range = Self::IP_RANGES.to_vec();
 
-        let mut used_ips = all_assigned
-            .iter()
-            .map(|ip_assignment| ip_assignment.ip)
-            .collect::<HashSet<_>>();
-        used_ips.extend(
-            all_candidates
-                .iter()
-                .map(|ip_candidate| ip_candidate.ip)
-                .collect::<HashSet<_>>(),
-        );
+        println!("RAnge 10: {:?}", &next_ip_range[..10]);
 
-        // Scan for the first available IP starting from 172.30.0.2
-        for i in 2u16..65534 {
-            let octet3 = (i >> 8) as u8;
-            let octet4 = (i & 0xFF) as u8;
-
-            // Skip network/broadcast addresses if needed, though 172.30.0.0/16 is a large subnet.
-            // Keeping it simple: avoid .0 and .255 in the last octet to be safe for standard /24 clients
-            if octet4 == 0 || octet4 == 255 {
-                continue;
-            }
-
-            let ip = Ipv4Addr::new(172, 30, octet3, octet4);
-            if !used_ips.contains(&ip) {
-                return Ok(ip);
-            }
+        for assignment in self.read_all_ip_assignments(false)? {
+            let index = ((u16::from(assignment.ip.octets()[2]) << 8)
+                | u16::from(assignment.ip.octets()[3])) as usize
+                - 2;
+            next_ip_range[index].0 += u16::MAX as usize; // push used IPs to the end of the list
         }
 
-        bail!("no more ips available");
+        for candidate in self.read_all_ip_candidates(false)? {
+            let index = ((u16::from(candidate.ip.octets()[2]) << 8)
+                | u16::from(candidate.ip.octets()[3])) as usize
+                - 2;
+            next_ip_range[index].0 += u16::MAX as usize; // push used IPs to the end of the list
+        }
+
+        for assignment in self.read_all_ip_assignments(true)? {
+            let index = ((u16::from(assignment.ip.octets()[2]) << 8)
+                | u16::from(assignment.ip.octets()[3])) as usize
+                - 2;
+            next_ip_range[index].0 = 0; // order == 0 => taken
+        }
+
+        for candidate in self.read_all_ip_candidates(true)? {
+            let index = ((u16::from(candidate.ip.octets()[2]) << 8)
+                | u16::from(candidate.ip.octets()[3])) as usize
+                - 2;
+            next_ip_range[index].0 = 0; // order == 0 => taken
+        }
+
+        next_ip_range.sort_by_key(|(order, _)| *order);
+        println!("Next IP range order: {:?}", &next_ip_range[..10]);
+        next_ip_range
+            .iter()
+            .find_map(|(order, ip)| {
+                if *order == 0 || ip.octets()[3] == 255 {
+                    None
+                } else {
+                    Some(*ip)
+                }
+            })
+            .ok_or_else(|| anyhow::anyhow!("No available IPs"))
     }
 }
