@@ -1,21 +1,16 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointId, SecretKey, endpoint::QuicTransportConfig};
 use iroh_auth::Authenticator;
-use iroh_blobs::{
-    BlobsProtocol,
-    store::{
-        GcConfig,
-        mem::{MemStore, Options},
-    },
-};
-use iroh_docs::protocol::Docs;
+
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
+use iroh_quinn_proto::{IdleTimeout, VarInt, congestion};
 use iroh_topic_tracker::TopicDiscoveryHook;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
@@ -39,6 +34,7 @@ struct NetworkActor {
     _auth: Authenticator,
 
     _iroh_router: iroh::protocol::Router,
+    //_docs_router: iroh::protocol::Router,
     _iroh_endpoint: iroh::endpoint::Endpoint,
 
     tun: Option<Tun>,
@@ -56,6 +52,31 @@ struct NetworkActor {
     pending_packets: HashMap<std::net::Ipv4Addr, VecDeque<(Instant, Ipv4Pkg)>>,
 }
 
+fn transport_config() -> QuicTransportConfig {
+    const EXPECTED_RTT: u32 = 600;
+    const MAX_STREAM_BANDWIDTH: u32 = 125_000;
+    const STREAM_RWND: u32 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT * 2;
+
+    QuicTransportConfig::builder()
+        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(60_000))))
+        .keep_alive_interval(Duration::from_millis(15_000))
+        .stream_receive_window(STREAM_RWND.into())
+        .receive_window(VarInt::MAX)
+        .send_window((4 * STREAM_RWND).into())
+        .send_fairness(true)
+        .packet_threshold(5)
+        .time_threshold(1.5)
+        .initial_rtt(Duration::from_millis(EXPECTED_RTT as u64))
+        .initial_mtu(1280)
+        .min_mtu(1200)
+        .mtu_discovery_config(None)
+        .persistent_congestion_threshold(5)
+        .congestion_controller_factory(Arc::new(congestion::BbrConfig::default()))
+        .datagram_receive_buffer_size(Some(STREAM_RWND as usize))
+        .datagram_send_buffer_size(STREAM_RWND as usize)
+        .build()
+}
+
 impl Network {
     pub async fn new(name: &str, password: &str) -> Result<Self> {
         let secret_key = SecretKey::generate(&mut rand::rng());
@@ -71,6 +92,7 @@ impl Network {
             .hooks(auth.clone())
             .hooks(topic_discovery_hook.clone())
             .secret_key(secret_key.clone())
+            .transport_config(transport_config())
             .bind()
             .await?;
         auth.set_endpoint(&endpoint);
@@ -84,25 +106,13 @@ impl Network {
             .membership_config(gossip_config)
             .spawn(endpoint.clone());
 
-        let blobs = MemStore::new_with_opts(Options {
-            gc_config: Some(GcConfig {
-                interval: Duration::from_millis(1000),
-                add_protected: None,
-            }),
-        });
-        let docs = Docs::memory()
-            .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
-            .await?;
-
         let (direct_connect_tx, direct_connect_rx) = tokio::sync::mpsc::channel(1024 * 16);
         let direct = Direct::new(endpoint.clone(), direct_connect_tx.clone());
 
-        let _router = iroh::protocol::Router::builder(endpoint.clone())
+        let _iroh_router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(iroh_auth::ALPN, auth.clone())
-            .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(crate::Direct::ALPN, direct.clone())
-            .accept(iroh_docs::ALPN, docs.clone())
-            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
+            .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 
         let router = crate::Router::builder(topic_discovery_hook)
@@ -111,8 +121,6 @@ impl Network {
             .secret_key(secret_key)
             .endpoint(endpoint.clone())
             .gossip(gossip)
-            .docs(docs)
-            .blobs(blobs)
             .build()
             .await?;
 
@@ -127,7 +135,8 @@ impl Network {
                 direct,
                 _auth: auth,
 
-                _iroh_router: _router,
+                _iroh_router,
+                //_docs_router,
                 _iroh_endpoint: endpoint,
 
                 tun: None,
@@ -197,7 +206,7 @@ impl Actor<anyhow::Error> for NetworkActor {
         cache_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         debug!("NetworkActor started");
-        
+
         loop {
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => {

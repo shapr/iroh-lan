@@ -55,7 +55,7 @@ pub async fn run_cli() -> Result<()> {
         use tracing_subscriber::{EnvFilter, fmt, prelude::*};
         tracing_subscriber::registry()
             .with(fmt::layer().with_thread_ids(true))
-            .with(EnvFilter::new("iroh_lan=debug,iroh_auth=debug"))
+            .with(EnvFilter::new("iroh_lan=debug,iroh_auth=debug,iroh_topic_tracker=debug"))
             .init();
     }
 
@@ -262,7 +262,7 @@ async fn update_state(network: &Network, state: &mut AppState) -> Result<()> {
             state.my_ip = ip.to_string();
         }
         Err(e) => {
-            state.status = format!("Error: {}", e);
+            state.status = format!("Router update error: {}", e);
         }
     }
 

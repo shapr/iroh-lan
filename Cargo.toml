@@ -37,11 +37,12 @@ bytes = "1"
 chrono = { version = "0.4" }
 
 #iroh-auth = { version = "0.1.2" }
-iroh-auth = { git = "https://github.com/rustonbsd/iroh-auth", rev="22cd833aed93b280ccadad6f26ff2f5cf9642294" }
+iroh-auth = { git = "https://github.com/rustonbsd/iroh-auth", rev="a1daa08920244a8bcbaf98384fb1ea75fe8ee6cb" }
 actor-helper = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 ratatui = "0.30.0"
 crossterm = "0.29.0"
+iroh-quinn-proto = "0.15"
 
 
 

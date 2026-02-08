@@ -5,26 +5,21 @@ use std::{
 };
 
 use ed25519_dalek::SigningKey;
-use futures::StreamExt;
-use iroh_blobs::store::mem::MemStore;
-use iroh_docs::{AuthorId, Entry, NamespaceSecret, api::Doc, protocol::Docs, store::Query};
-
-use anyhow::{Result, bail};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
-use iroh_gossip::{
-    api::{GossipReceiver, GossipSender},
-    net::Gossip,
-};
+use iroh_gossip::net::Gossip;
 use iroh_topic_tracker::{
     TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle, TopicDiscoveryHook,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
+use anyhow::{Result, bail};
+use iroh::{Endpoint, EndpointId, SecretKey};
+
 use actor_helper::{Action, Actor, Handle, act, act_ok};
+
+use crate::kv::{Kv, KvEvent};
 
 #[derive(Debug, Clone)]
 pub struct Builder {
@@ -34,8 +29,6 @@ pub struct Builder {
     password: String,
     endpoint: Option<Endpoint>,
     gossip: Option<Gossip>,
-    docs: Option<Docs>,
-    blobs: MemStore,
 }
 
 impl Builder {
@@ -47,8 +40,6 @@ impl Builder {
             password: String::default(),
             endpoint: None,
             gossip: None,
-            docs: None,
-            blobs: MemStore::new(),
         }
     }
 
@@ -77,16 +68,6 @@ impl Builder {
         self
     }
 
-    pub fn docs(mut self, docs: Docs) -> Self {
-        self.docs = Some(docs);
-        self
-    }
-
-    pub fn blobs(mut self, blobs: MemStore) -> Self {
-        self.blobs = blobs;
-        self
-    }
-
     pub async fn build(&self) -> Result<Router> {
         let endpoint = if let Some(ep) = &self.endpoint {
             ep.clone()
@@ -98,12 +79,6 @@ impl Builder {
         } else {
             bail!("gossip must be set");
         };
-        let docs = if let Some(d) = &self.docs {
-            d.clone()
-        } else {
-            bail!("docs must be set");
-        };
-        let blobs = self.blobs.clone();
 
         let topic_initials = format!("lanparty-{}", self.entry_name);
         let secret_initials = format!("{topic_initials}-{}-secret", self.password)
@@ -117,7 +92,8 @@ impl Builder {
 
         let signing_key = SigningKey::from_bytes(&self.secret_key.to_bytes());
         let topic_discovery_config =
-            TopicDiscoveryConfig::new(signing_key, self.topic_discovery_hook.clone());
+            TopicDiscoveryConfig::new(signing_key, self.topic_discovery_hook.clone())
+                .connection_timeout(Duration::from_secs(10));
         let (gossip_sender, gossip_receiver, topic_handle) = loop {
             if let Ok((gossip_sender, gossip_receiver, topic_handle)) = gossip
                 .subscribe_with_discovery_joined(
@@ -135,67 +111,21 @@ impl Builder {
         };
 
         info!("Joined topic with hash: {:x?}", topic_hash);
-        let doc_peers = gossip_receiver
-            .neighbors()
-            .map(EndpointAddr::new)
-            .collect::<Vec<_>>();
-        info!("Initial doc peers: {:?}", doc_peers);
 
-        debug!("[Doc peers]: {:?}", doc_peers);
+        let kv = Kv::spawn(gossip_sender, gossip_receiver);
 
-        let author_id = docs.author_create().await?;
-        let doc = docs
-            .import(iroh_docs::DocTicket {
-                capability: iroh_docs::Capability::Write(NamespaceSecret::from_bytes(&topic_hash)),
-                nodes: doc_peers.clone(),
-            })
-            .await?;
-
-        while match doc.get_sync_peers().await {
-            Ok(Some(peers)) => peers.is_empty(),
-            Ok(None) => true,
-            Err(_) => true,
-        } {
-            if let Ok(Some(peers)) = doc.get_sync_peers().await
-                && peers
-                    != gossip_receiver
-                        .neighbors()
-                        .map(|a| *a.as_bytes())
-                        .collect::<Vec<_>>()
-            {
-                doc.start_sync(
-                    gossip_receiver
-                        .neighbors()
-                        .map(EndpointAddr::new)
-                        .collect::<Vec<_>>(),
-                )
-                .await
-                .ok();
-                debug!(
-                    "Doc sync peers updated: {:?}",
-                    gossip_receiver
-                        .neighbors()
-                        .map(EndpointAddr::new)
-                        .collect::<Vec<_>>()
-                );
-            }
-            debug!("Waiting for doc to be ready...");
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-        }
+        // Write our startup entry (immediately broadcast via gossip).
+        let startup_key = format!("{}{}", key_startup_prefix(), endpoint.id());
+        kv.insert(startup_key).await;
 
         let (api, rx) = Handle::channel();
         tokio::spawn(async move {
             let mut router_actor = RouterActor {
-                _gossip_sender: gossip_sender,
-                gossip_monitor: gossip_receiver,
-                author_id,
-                _docs: docs,
-                doc,
+                kv,
                 _endpoint: endpoint.clone(),
                 endpoint_id: endpoint.id(),
                 _topic: topic_handle,
                 rx,
-                _blobs: blobs,
                 my_ip: RouterIp::NoIp,
                 assignments: BTreeMap::new(),
                 candidates: BTreeMap::new(),
@@ -225,13 +155,7 @@ pub enum RouterIp {
 struct RouterActor {
     pub(crate) rx: actor_helper::Receiver<Action<RouterActor>>,
 
-    pub _gossip_sender: GossipSender,
-    pub gossip_monitor: GossipReceiver,
-
-    pub(crate) _blobs: MemStore,
-    pub(crate) _docs: Docs,
-    pub(crate) doc: Doc,
-    pub(crate) author_id: AuthorId,
+    pub kv: Kv,
 
     pub(crate) _endpoint: Endpoint,
     pub endpoint_id: EndpointId,
@@ -241,147 +165,7 @@ struct RouterActor {
 
     assignments: BTreeMap<Ipv4Addr, IpAssignment>,
     candidates: BTreeMap<Ipv4Addr, BTreeMap<EndpointId, IpCandidate>>,
-    startup_entries: BTreeSet<AuthorId>,
-}
-
-#[derive(Debug)]
-enum DocCacheUpdate {
-    Assignment(IpAssignment),
-    Candidate(IpCandidate),
-    Startup(AuthorId),
-}
-
-async fn handle_doc_entry(
-    entry: Entry,
-    updates: &tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>,
-) -> Result<()> {
-    let key = match std::str::from_utf8(entry.key()) {
-        Ok(k) => k,
-        Err(e) => {
-            warn!("Invalid entry key utf8: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    let assigned_prefix = key_assigned_ip();
-    let candidate_prefix = key_candidate_ip_prefix();
-    let startup_prefix = key_startup_prefix();
-
-    // Assignment
-    if key.starts_with(&assigned_prefix) {
-        let ip_assignment = match decode_ip_assignment(key) {
-            Ok(a) => a,
-            Err(e) => {
-                warn!("Failed to decode ip assignment from key {}: {}", key, e);
-                return Err(e);
-            }
-        };
-        updates.send(DocCacheUpdate::Assignment(ip_assignment))?;
-        return Ok(());
-    }
-    // Candidate
-    else if key.starts_with(&candidate_prefix) {
-        let ip_candidate = match decode_ip_candidate(key) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to decode ip candidate from key {}: {}", key, e);
-                return Err(e);
-            }
-        };
-        updates.send(DocCacheUpdate::Candidate(ip_candidate))?;
-        return Ok(());
-    } else if key.starts_with(&startup_prefix) {
-        let author_id = match decode_author_id_from_startup(key) {
-            Ok(id) => id,
-            Err(e) => {
-                warn!("Failed to decode author id from startup key {}: {}", key, e);
-                return Err(e);
-            }
-        };
-        updates.send(DocCacheUpdate::Startup(author_id))?;
-        return Ok(());
-    }
-
-    warn!(
-        "[Doc] Unknown entry key prefix, skipping processing for key {}",
-        key
-    );
-    Err(anyhow::anyhow!("Unhandled doc entry"))
-}
-
-async fn run_doc_worker(
-    author_id: AuthorId,
-    doc: Doc,
-    updates: tokio::sync::mpsc::UnboundedSender<DocCacheUpdate>,
-) {
-    doc.set_bytes(
-        author_id,
-        format!("{}{}", key_startup_prefix(), author_id),
-        author_id.to_string(),
-    )
-    .await
-    .ok();
-
-    loop {
-        match doc.get_many(Query::key_prefix(key_startup_prefix())).await {
-            Ok(it) => {
-                let count = it.count().await;
-                if count >= 2 {
-                    break;
-                } else {
-                    warn!(
-                        "Doc not ready yet, {} entries found with startup prefix",
-                        count
-                    );
-                }
-            }
-            Err(e) => warn!("Failed to query doc for startup entries: {}", e),
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-
-    match doc.get_many(Query::all()).await {
-        Ok(stream) => {
-            let entries = stream.collect::<Vec<_>>().await;
-            for entry in entries.into_iter().flatten() {
-                if let Err(e) = handle_doc_entry(entry, &updates).await {
-                    warn!(
-                        "[Doc] Failed to handle doc entry during initial population: {:?}",
-                        e
-                    );
-                }
-            }
-        }
-        Err(e) => warn!("Failed to populate cache: {}", e),
-    }
-
-    let mut docs_sub = match doc.subscribe().await {
-        Ok(sub) => sub,
-        Err(e) => {
-            warn!("Docs subscription failed: {}", e);
-            return;
-        }
-    };
-
-    loop {
-        tokio::select! {
-            Some(event) = docs_sub.next() => {
-                match event {
-                    Ok(e) => match e {
-                        iroh_docs::engine::LiveEvent::InsertLocal { entry }
-                        | iroh_docs::engine::LiveEvent::InsertRemote { entry, .. } => {
-                            if let Err(e) = handle_doc_entry(entry, &updates,).await {
-                                warn!("[Doc] Failed to handle doc entry: {:?}", e);
-                            };
-                        }
-                        _ => {}
-                    },
-                    Err(e) => warn!("Docs subscription stream error: {:?}", e),
-                }
-            }
-            else => break,
-        }
-    }
+    startup_entries: BTreeSet<EndpointId>,
 }
 
 impl Router {
@@ -438,27 +222,21 @@ impl Router {
             }))
             .await
     }
-
-    pub async fn close(&self) -> Result<()> {
-        self.api.call(act!(actor => actor.doc.close())).await
-    }
 }
 
 impl Actor<anyhow::Error> for RouterActor {
     async fn run(&mut self) -> Result<()> {
-        let mut ip_tick = tokio::time::interval(Duration::from_millis(500));
+        let mut ip_tick = tokio::time::interval(Duration::from_millis(1000));
         ip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         debug!("RouterActor started. EndpointId: {}", self.endpoint_id);
 
         let mut last_ip_state = self.my_ip.clone();
 
-        let (doc_update_tx, mut doc_update_rx) = tokio::sync::mpsc::unbounded_channel();
-        let doc = self.doc.clone();
-        let author_id = self.author_id;
-        tokio::spawn(async move {
-            run_doc_worker(author_id, doc, doc_update_tx).await;
-        });
+        self.populate_from_kv().await;
+
+        let mut kv_sub = self.kv.subscribe();
+
         loop {
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => {
@@ -470,11 +248,8 @@ impl Actor<anyhow::Error> for RouterActor {
                     break
                 }
 
-                Some(event) = self.gossip_monitor.next() => {
-                    match event {
-                        Ok(e) => debug!("Gossip monitor event: {:?}", e),
-                        Err(e) => warn!("Gossip monitor stream error: {:?}", e),
-                    }
+                Ok(event) = kv_sub.recv() => {
+                    self.handle_kv_event(&event);
                 }
 
                 // advance ip state machine
@@ -493,37 +268,59 @@ impl Actor<anyhow::Error> for RouterActor {
                             warn!("Error advancing IP state: {}", e);
                         }
                     }
-
-                    trace!("Doc peer sync");
-                    // Add doc sync or direct gossip spawn
-                }
-
-                Some(update) = doc_update_rx.recv() => {
-                    match update {
-                        DocCacheUpdate::Assignment(ip_assignment) => {
-                            self.assignments.insert(ip_assignment.ip, ip_assignment);
-                        }
-                        DocCacheUpdate::Candidate(ip_candidate) => {
-                            match self.candidates.get_mut(&ip_candidate.ip) {
-                                Some(cands) => {
-                                    cands.insert(ip_candidate.endpoint_id, ip_candidate);
-                                }
-                                None => {
-                                    let mut map = BTreeMap::new();
-                                    map.insert(ip_candidate.endpoint_id, ip_candidate.clone());
-                                    self.candidates.insert(ip_candidate.ip, map);
-                                },
-                            }
-                        }
-                        DocCacheUpdate::Startup(author_id) => {
-                            self.startup_entries.insert(author_id);
-                        }
-                    }
                 }
             }
         }
         warn!("RouterActor stopped.");
         Ok(())
+    }
+}
+
+impl RouterActor {
+    async fn populate_from_kv(&mut self) {
+        let all_keys = self.kv.query_all().await;
+        for key in all_keys {
+            self.apply_key(&key);
+        }
+        debug!(
+            "Populated from Kv: {} startup, {} assignments, {} candidate IPs",
+            self.startup_entries.len(),
+            self.assignments.len(),
+            self.candidates.len(),
+        );
+    }
+
+    fn handle_kv_event(&mut self, event: &KvEvent) {
+        self.apply_key(&event.key);
+    }
+
+    fn apply_key(&mut self, key: &str) {
+        let startup_prefix = key_startup_prefix();
+        let assigned_prefix = key_assigned_ip();
+        let candidate_prefix = key_candidate_ip_prefix();
+
+        if key.starts_with(&startup_prefix) {
+            if let Ok(endpoint_id) = decode_endpoint_id_from_startup(key)
+                && self.startup_entries.insert(endpoint_id)
+            {
+                info!(
+                    "Startup entry added for {}. Total: {}",
+                    endpoint_id,
+                    self.startup_entries.len()
+                );
+            }
+        } else if key.starts_with(&assigned_prefix) {
+            if let Ok(ip_assignment) = decode_ip_assignment(key) {
+                self.assignments.insert(ip_assignment.ip, ip_assignment);
+            }
+        } else if key.starts_with(&candidate_prefix)
+            && let Ok(ip_candidate) = decode_ip_candidate(key)
+        {
+            self.candidates
+                .entry(ip_candidate.ip)
+                .or_default()
+                .insert(ip_candidate.endpoint_id, ip_candidate);
+        }
     }
 }
 
@@ -635,7 +432,7 @@ fn encode_ip_candidate(candidate: &IpCandidate) -> String {
     )
 }
 
-fn decode_author_id_from_startup(key: &str) -> Result<AuthorId> {
+fn decode_endpoint_id_from_startup(key: &str) -> Result<EndpointId> {
     let parts: Vec<&str> = key.split('/').collect();
     if parts.len() != 3 {
         warn!(
@@ -644,11 +441,11 @@ fn decode_author_id_from_startup(key: &str) -> Result<AuthorId> {
         );
         anyhow::bail!("Invalid key format for startup entry");
     }
-    if let Ok(author_id) = parts[2].parse::<AuthorId>() {
-        Ok(author_id)
+    if let Ok(endpoint_id) = parts[2].parse::<EndpointId>() {
+        Ok(endpoint_id)
     } else {
         warn!(
-            "Failed to parse AuthorId from startup key (parse failed): {}",
+            "Failed to parse EndpointId from startup key (parse failed): {}",
             key
         );
         anyhow::bail!("Invalid key format for startup entry");
@@ -685,10 +482,10 @@ impl RouterActor {
     fn read_all_ip_assignments(&self, filter_stale: bool) -> Result<Vec<IpAssignment>> {
         if !self.is_initialized() {
             warn!(
-                "[Doc] read_all_ip_assignments called before initialized. Startup entries count: {}",
+                "[Kv] read_all_ip_assignments called before initialized. Startup entries count: {}",
                 self.startup_entries.len()
             );
-            bail!("[Doc] not initialized yet");
+            bail!("[Kv] not initialized yet");
         }
         Ok(self
             .assignments
@@ -701,10 +498,10 @@ impl RouterActor {
     fn read_all_ip_candidates(&self, filter_stale: bool) -> Result<Vec<IpCandidate>> {
         if !self.is_initialized() {
             warn!(
-                "[Doc] read_all_ip_candidates called before initialized. Startup entries count: {}",
+                "[Kv] read_all_ip_candidates called before initialized. Startup entries count: {}",
                 self.startup_entries.len()
             );
-            bail!("[Doc] not initialized yet");
+            bail!("[Kv] not initialized yet");
         }
         Ok(self
             .candidates
@@ -719,10 +516,10 @@ impl RouterActor {
     fn read_ip_assignment(&self, ip: Ipv4Addr, filter_stale: bool) -> Result<Option<IpAssignment>> {
         if !self.is_initialized() {
             warn!(
-                "[Doc] read_ip_assignment called before initialized. Startup entries count: {}",
+                "[Kv] read_ip_assignment called before initialized. Startup entries count: {}",
                 self.startup_entries.len()
             );
-            bail!("[Doc] not initialized yet");
+            bail!("[Kv] not initialized yet");
         }
         let mut assignments = self
             .assignments
@@ -738,10 +535,10 @@ impl RouterActor {
     fn read_ip_candidates(&self, ip: Ipv4Addr, filter_stale: bool) -> Result<Vec<IpCandidate>> {
         if !self.is_initialized() {
             warn!(
-                "[Doc] read_ip_candidates called before initialized. Startup entries count: {}",
+                "[Kv] read_ip_candidates called before initialized. Startup entries count: {}",
                 self.startup_entries.len()
             );
-            bail!("[Doc] not initialized yet");
+            bail!("[Kv] not initialized yet");
         }
         let mut ip_candidates = match self.candidates.get(&ip) {
             Some(candidates) => candidates
@@ -760,10 +557,10 @@ impl RouterActor {
     async fn write_ip_assignment(&mut self, ip: Ipv4Addr, endpoint_id: EndpointId) -> Result<()> {
         if !self.is_initialized() {
             warn!(
-                "[Doc] write_ip_assignment called before initialized. Startup entries count: {}",
+                "[Kv] write_ip_assignment called before initialized. Startup entries count: {}",
                 self.startup_entries.len()
             );
-            bail!("[Doc] not initialized yet");
+            bail!("[Kv] not initialized yet");
         }
         info!("Attempting to assign IP {} to {}", ip, endpoint_id);
 
@@ -796,13 +593,7 @@ impl RouterActor {
             endpoint_id,
             last_updated: now,
         };
-        self.doc
-            .set_bytes(
-                self.author_id,
-                encode_ip_assignment(&ip_assignment),
-                now.to_le_bytes().to_vec(),
-            )
-            .await?;
+        self.kv.insert(encode_ip_assignment(&ip_assignment)).await;
         debug!("Wrote IP assignment {} for {}.", ip, endpoint_id);
 
         Ok(())
@@ -816,10 +607,10 @@ impl RouterActor {
     ) -> Result<IpCandidate> {
         if !self.is_initialized() {
             warn!(
-                "[Doc] write_ip_candidate called before initialized. Startup entries count: {}",
+                "[Kv] write_ip_candidate called before initialized. Startup entries count: {}",
                 self.startup_entries.len()
             );
-            bail!("[Doc] not initialized yet");
+            bail!("[Kv] not initialized yet");
         }
         // already assigned? don't write
         if self.read_ip_assignment(ip, true)?.is_some() {
@@ -839,13 +630,7 @@ impl RouterActor {
             endpoint_id,
             last_updated: now,
         };
-        self.doc
-            .set_bytes(
-                self.author_id,
-                encode_ip_candidate(&candidate),
-                now.to_le_bytes().to_vec(),
-            )
-            .await?;
+        self.kv.insert(encode_ip_candidate(&candidate)).await;
         debug!("Wrote IP candidate {} for {}.", ip, endpoint_id);
 
         Ok(candidate)
