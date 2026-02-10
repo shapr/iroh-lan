@@ -17,7 +17,7 @@ use ratatui::{
 use std::{collections::HashSet, io, net::Ipv4Addr, time::Duration};
 use tokio::time::sleep;
 
-use crate::{RouterIp, Network};
+use crate::{Network, RouterIp};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -55,7 +55,9 @@ pub async fn run_cli() -> Result<()> {
         use tracing_subscriber::{EnvFilter, fmt, prelude::*};
         tracing_subscriber::registry()
             .with(fmt::layer().with_thread_ids(true))
-            .with(EnvFilter::new("iroh_lan=debug,iroh_auth=debug,iroh_topic_tracker=debug"))
+            .with(EnvFilter::new(
+                "iroh_lan=debug,iroh_auth=debug,iroh_topic_tracker=debug,iroh=info",
+            ))
             .init();
     }
 
@@ -76,8 +78,7 @@ async fn run_headless(name: String, password: String) -> Result<()> {
     println!("Waiting for IP assignment...");
 
     loop {
-        let state = network.get_router_state().await?;
-        if let RouterIp::AssignedIp(ip) = state {
+        if let Ok(RouterIp::AssignedIp(ip)) = network.get_router_state().await {
             println!("My IP is {}", ip);
             break;
         }

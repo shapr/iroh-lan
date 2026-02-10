@@ -13,7 +13,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="d097e3ac5dad44f76faee4f42ae036f488db8322" }
+iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="a707fc4d9440c1599f4fb6ec8a8f4a261d22698e" }
 ed25519-dalek = "3.0.0-pre.1"
 iroh = "0.96.1"
 iroh-gossip = "0.96"
@@ -35,6 +35,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 chrono = { version = "0.4" }
+n0-watcher = "0.6"
 
 #iroh-auth = { version = "0.1.2" }
 iroh-auth = { git = "https://github.com/rustonbsd/iroh-auth", rev="a1daa08920244a8bcbaf98384fb1ea75fe8ee6cb" }

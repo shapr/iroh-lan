@@ -1,11 +1,21 @@
-use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures::StreamExt;
+use iroh::PublicKey;
 use iroh_gossip::api::{GossipReceiver, GossipSender};
+use n0_watcher::Watchable;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, broadcast};
+use tokio::{
+    sync::{Mutex, broadcast},
+    time::Instant,
+};
 use tracing::{debug, info, trace, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,20 +212,30 @@ impl Kv {
 
     /// Serialize + send via gossip.  Errors are logged, never propagated.
     async fn send(&self, msg: Message) {
-        match postcard::to_allocvec(&msg) {
-            Ok(bytes) => {
-                if let Err(e) = self.inner.sender.broadcast(Bytes::from(bytes)).await {
-                    warn!("[Kv] gossip broadcast failed: {}", e);
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            match postcard::to_allocvec(&msg) {
+                Ok(bytes) => {
+                    debug!("[Kv] Sending gossip message: {:?}", msg);
+                    if let Err(e) = inner.sender.broadcast(Bytes::from(bytes)).await {
+                        warn!("[Kv] gossip broadcast failed: {}", e);
+                    } else {
+                        debug!("[Kv] gossip broadcast succeeded");
+                    }
                 }
+                Err(e) => warn!("[Kv] serialize failed: {}", e),
             }
-            Err(e) => warn!("[Kv] serialize failed: {}", e),
-        }
+        });
     }
 }
 
 const JITTER_MIN_MS: u64 = 200;
 const JITTER_MAX_MS: u64 = 2_000;
 const PERIODIC_SYNC_SECS: u64 = 30;
+const PEER_DISCONNECT_BACKOFF_INIT_SECS: u64 = 2;
+const PEER_DISCONNECT_BACKOFF_INC_SECS: u64 = 2;
+const PEER_DISCONNECT_MAX_BACKOFF_SECS: u64 = 30;
+const PEER_DISCONNECT_MAX_RETRY_SECS: u64 = 120;
 
 async fn worker(kv: Kv, mut receiver: GossipReceiver) {
     use iroh_gossip::api::Event;
@@ -227,29 +247,45 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
     let mut periodic = tokio::time::interval(Duration::from_secs(PERIODIC_SYNC_SECS));
     periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let init_peers = receiver
+        .neighbors()
+        .map(|peer| (peer, None))
+        .collect::<BTreeMap<_, _>>();
+    let peer_disconnect_timings = Watchable::new(init_peers);
+
     // On startup, schedule an initial state broadcast so any existing peers
     // learn about keys we may have inserted before the worker started.
     schedule_state(&mut state_timer, &mut state_pending);
-
     loop {
         tokio::select! {
-            Some(event) = receiver.next() => {
+            event = receiver.next() => {
                 match event {
-                    Ok(Event::Received(msg)) => {
+                    Some(Ok(Event::Received(msg))) => {
                         handle_received(&kv, &msg.content, &mut state_pending).await;
                     }
-                    Ok(Event::NeighborUp(peer)) => {
+                    Some(Ok(Event::NeighborUp(peer))) => {
+                        let mut peers = peer_disconnect_timings.get();
+                        peers.insert(peer, None);
+                        peer_disconnect_timings.set(peers).ok();
+
                         info!("[Kv] NeighborUp: {}, scheduling state broadcast", peer);
                         schedule_state(&mut state_timer, &mut state_pending);
                     }
-                    Ok(Event::NeighborDown(peer)) => {
+                    Some(Ok(Event::NeighborDown(peer))) => {
+                        let mut peers = peer_disconnect_timings.get();
+                        peers.insert(peer, Some(Instant::now()));
+                        peer_disconnect_timings.set(peers).ok();
+                        reconnect_peer(&peer_disconnect_timings, &kv, &peer);
                         debug!("[Kv] NeighborDown: {}", peer);
                     }
-                    Ok(Event::Lagged) => {
+                    Some(Ok(Event::Lagged)) => {
                         warn!("[Kv] Gossip lagged, scheduling state broadcast");
                         schedule_state(&mut state_timer, &mut state_pending);
                     }
-                    Err(e) => warn!("[Kv] gossip stream error: {}", e),
+                    Some(Err(e)) => warn!("[Kv] gossip stream error: {}", e),
+                    None => {
+                        warn!("[Kv] gossip stream ended, exiting worker");
+                    }
                 }
             }
             _ = &mut state_timer, if state_pending => {
@@ -261,6 +297,36 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
             }
         }
     }
+}
+
+fn reconnect_peer(
+    peer_disconnect_timings: &Watchable<BTreeMap<PublicKey, Option<Instant>>>,
+    kv: &Kv,
+    peer: &PublicKey,
+) {
+    tokio::spawn({
+        let kv = kv.clone();
+        let peer_disconnect_timings = peer_disconnect_timings.clone();
+        let peer = *peer;
+        async move {
+            let mut backoff = PEER_DISCONNECT_BACKOFF_INIT_SECS;
+            while let Some(Some(disconnected_since)) = peer_disconnect_timings.get().get(&peer)
+                && disconnected_since.elapsed()
+                    < Duration::from_secs(PEER_DISCONNECT_MAX_RETRY_SECS)
+            {
+                kv.inner.sender.join_peers(vec![peer]).await.ok();
+                debug!(
+                    "[Kv] Attempting to rejoin peer {} (disconnected for {}s, backoff {}s)",
+                    peer,
+                    disconnected_since.elapsed().as_secs(),
+                    backoff,
+                );
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff + PEER_DISCONNECT_BACKOFF_INC_SECS)
+                    .min(PEER_DISCONNECT_MAX_BACKOFF_SECS);
+            }
+        }
+    });
 }
 
 /// Reset the state-broadcast timer to fire after a random jitter.
@@ -279,8 +345,11 @@ fn schedule_state(timer: &mut Pin<Box<tokio::time::Sleep>>, pending: &mut bool) 
 
 /// Parse and apply one incoming gossip message.
 ///
-/// When a `State` message is received from another peer, any pending local
-/// state broadcast is cancelled, that peer already did the work.
+/// When a `State` message is received from another peer we only cancel our
+/// pending local broadcast if the remote state already covers everything we
+/// have (same keys, same or newer timestamps).  If we have keys or newer
+/// timestamps that the remote is missing, we keep the pending broadcast so
+/// the remote learns about our state.
 async fn handle_received(kv: &Kv, raw: &[u8], state_pending: &mut bool) {
     let msg: Message = match postcard::from_bytes(raw) {
         Ok(m) => m,
@@ -302,17 +371,15 @@ async fn handle_received(kv: &Kv, raw: &[u8], state_pending: &mut bool) {
             }
         }
         Message::State { entries, .. } => {
-            // Another peer already broadcast state, cancel our pending one.
-            if *state_pending {
-                debug!("[Kv] received remote state, cancelling pending local broadcast");
-                *state_pending = false;
-            }
+            let remote_map: std::collections::HashMap<&str, u64> =
+                entries.iter().map(|(k, ts)| (k.as_str(), *ts)).collect();
+
             let mut applied = 0usize;
-            for (key, timestamp) in entries {
-                if kv.apply(&key, timestamp).await {
+            for (key, timestamp) in &entries {
+                if kv.apply(key, *timestamp).await {
                     let _ = kv.inner.updates.send(KvEvent {
-                        key,
-                        timestamp,
+                        key: key.clone(),
+                        timestamp: *timestamp,
                         remote: true,
                     });
                     applied += 1;
@@ -320,6 +387,26 @@ async fn handle_received(kv: &Kv, raw: &[u8], state_pending: &mut bool) {
             }
             if applied > 0 {
                 debug!("[Kv] state merge: {} keys applied", applied);
+            }
+
+            if *state_pending {
+                let store = kv.inner.store.lock().await;
+                let we_have_extra = store
+                    .iter()
+                    .any(|(k, &ts)| match remote_map.get(k.as_str()) {
+                        None => true,
+                        Some(&remote_ts) => ts > remote_ts,
+                    });
+                if we_have_extra {
+                    debug!(
+                        "[Kv] received remote state but we have keys they don't, keeping pending broadcast"
+                    );
+                } else {
+                    debug!(
+                        "[Kv] received remote state that covers ours, cancelling pending broadcast"
+                    );
+                    *state_pending = false;
+                }
             }
         }
     }

@@ -1,5 +1,5 @@
 use actor_helper::{Action, Handle, act, act_ok};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use iroh::{
     EndpointId,
     endpoint::{Connection, VarInt},
@@ -155,14 +155,12 @@ impl DirectActor {
                 remote_id
             );
         }
-        let prefer_incoming = self.endpoint.id() > remote_id;
-
         if let Some(conn_ref) = self.peers.get(&remote_id) {
             let state = conn_ref.get_state().await;
-            if state != crate::connection::ConnState::Disconnected && !prefer_incoming {
+            if state == crate::connection::ConnState::Open {
                 warn!(
-                    "Race Condition: Rejecting incoming connection from {} (Existing state: {:?}, Prefer Incoming: {})",
-                    remote_id, state, prefer_incoming
+                    "Race Condition: Rejecting incoming connection from {} (Existing state: {:?})",
+                    remote_id, state
                 );
                 conn.close(VarInt::from_u32(409), b"duplicate connection");
                 return Ok(());
@@ -197,12 +195,11 @@ impl DirectActor {
         recv: iroh::endpoint::RecvStream,
     ) -> Result<()> {
         let remote_id = conn.remote_id();
-        let prefer_incoming = self.endpoint.id() > remote_id;
 
         match self.peers.entry(remote_id) {
             Entry::Occupied(mut entry) => {
                 let state = entry.get().get_state().await;
-                if state != crate::connection::ConnState::Open || prefer_incoming {
+                if state != crate::connection::ConnState::Open {
                     if state != crate::connection::ConnState::Open {
                         info!(
                             "Replacing existing connection to {} in state {:?}",
@@ -259,20 +256,15 @@ impl DirectActor {
             }
             Entry::Vacant(entry) => {
                 info!("No active connection to {}, initiating new connection", to);
-                
-                if self.endpoint.id() > to {
-                    let conn =
-                        Conn::connect(self.endpoint.clone(), to, self.direct_connect_tx.clone()).await;
 
-                    if let Err(e) = conn.write(pkg).await {
-                        error!("Failed to write packet to new connection {}: {}", to, e);
-                        return Err(e);
-                    }
-                    entry.insert(conn);
-                } else {
-                    warn!("no connection yet, prefer incoming");
-                    bail!("no connection yet, prefer incoming")
+                let conn =
+                    Conn::connect(self.endpoint.clone(), to, self.direct_connect_tx.clone()).await;
+
+                if let Err(e) = conn.write(pkg).await {
+                    error!("Failed to write packet to new connection {}: {}", to, e);
+                    return Err(e);
                 }
+                entry.insert(conn);
             }
         }
 
@@ -280,9 +272,6 @@ impl DirectActor {
     }
 
     async fn ensure_connection(&mut self, to: EndpointId) -> Result<()> {
-        if self.endpoint.id() > to {
-            return Ok(());
-        }
         if self.peers.contains_key(&to) {
             return Ok(());
         }

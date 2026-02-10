@@ -92,8 +92,10 @@ impl Builder {
 
         let signing_key = SigningKey::from_bytes(&self.secret_key.to_bytes());
         let topic_discovery_config =
-            TopicDiscoveryConfig::new(signing_key, self.topic_discovery_hook.clone())
-                .connection_timeout(Duration::from_secs(10));
+            TopicDiscoveryConfig::builder(signing_key, self.topic_discovery_hook.clone())
+                .connection_timeout(Duration::from_secs(15))
+                .dht_retries(None)
+                .build();
         let (gossip_sender, gossip_receiver, topic_handle) = loop {
             if let Ok((gossip_sender, gossip_receiver, topic_handle)) = gossip
                 .subscribe_with_discovery_joined(
@@ -113,10 +115,6 @@ impl Builder {
         info!("Joined topic with hash: {:x?}", topic_hash);
 
         let kv = Kv::spawn(gossip_sender, gossip_receiver);
-
-        // Write our startup entry (immediately broadcast via gossip).
-        let startup_key = format!("{}{}", key_startup_prefix(), endpoint.id());
-        kv.insert(startup_key).await;
 
         let (api, rx) = Handle::channel();
         tokio::spawn(async move {
@@ -240,7 +238,6 @@ impl Actor<anyhow::Error> for RouterActor {
         loop {
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => {
-                    trace!("Action received");
                     action(self).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -248,21 +245,39 @@ impl Actor<anyhow::Error> for RouterActor {
                     break
                 }
 
-                Ok(event) = kv_sub.recv() => {
-                    self.handle_kv_event(&event);
+                result = kv_sub.recv() => {
+                    match result {
+                        Ok(event) => {
+                            self.handle_kv_event(&event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("[ROUTER_LOOP] kv_sub lagged by {} messages!", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            warn!("[ROUTER_LOOP] kv_sub channel closed!");
+                            break;
+                        }
+                    }
                 }
 
                 // advance ip state machine
                 _ = ip_tick.tick() => {
-                    trace!("IP tick");
                     if self.startup_entries.len() < 2 {
+
+                        // Write our startup entry (immediately broadcast via gossip).
+                        let startup_key = format!("{}{}", key_startup_prefix(), self.endpoint_id);
+                        trace!("[ROUTER_LOOP] Calling kv.insert for startup");
+                        self.kv.insert(startup_key).await;
+                        trace!("[ROUTER_LOOP] kv.insert completed");
                         trace!("Not advancing IP state, waiting for startup entries. Current count: {}", self.startup_entries.len());
                         continue;
                     }
                     match self.advance_ip_state().await {
-                        Ok(_) => if self.my_ip != last_ip_state {
-                            info!("Router IP state changed: {:?} -> {:?}", last_ip_state, self.my_ip);
-                            last_ip_state = self.my_ip.clone();
+                        Ok(_) => {
+                            if self.my_ip != last_ip_state {
+                                info!("Router IP state changed: {:?} -> {:?}", last_ip_state, self.my_ip);
+                                last_ip_state = self.my_ip.clone();
+                            }
                         },
                         Err(e) => {
                             warn!("Error advancing IP state: {}", e);
@@ -769,8 +784,6 @@ impl RouterActor {
     async fn get_next_ip(&mut self) -> Result<Ipv4Addr> {
         let mut next_ip_range = Self::IP_RANGES.to_vec();
 
-        println!("RAnge 10: {:?}", &next_ip_range[..10]);
-
         for assignment in self.read_all_ip_assignments(false)? {
             let index = ((u16::from(assignment.ip.octets()[2]) << 8)
                 | u16::from(assignment.ip.octets()[3])) as usize
@@ -800,7 +813,7 @@ impl RouterActor {
         }
 
         next_ip_range.sort_by_key(|(order, _)| *order);
-        println!("Next IP range order: {:?}", &next_ip_range[..10]);
+        info!("Next IP range order: {:?}", &next_ip_range[..10]);
         next_ip_range
             .iter()
             .find_map(|(order, ip)| {

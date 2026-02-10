@@ -15,7 +15,7 @@ use tracing::{debug, info, trace, warn};
 const QUEUE_SIZE: usize = 1024 * 16;
 const MAX_RECONNECTS: usize = 100;
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(3);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const BACKPRESSURE_WARN_MS: u128 = 5;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SENDER_QUEUE: usize = 50_000;
@@ -24,6 +24,7 @@ const MAX_CONSECUTIVE_WRITE_ERRORS: u64 = 3;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const QUEUE_WARN_LEN: usize = 10_000;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const CONNECTING_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct Conn {
@@ -125,36 +126,36 @@ impl Conn {
         });
         let s = Self { api };
 
-        debug!(
-            "Skipping proactive connection to {} (prefer incoming)",
-            endpoint_id
-        );
         tokio::spawn({
             let s = s.clone();
             async move {
-                match endpoint.connect(endpoint_id, crate::Direct::ALPN).await {
-                    Ok(conn) => match conn.open_bi().await {
-                        Ok((send, recv)) => {
-                            let _ = s.incoming_connection(conn, send, recv).await;
-                        }
-                        Err(e) => {
-                            warn!("Failed to open bi-stream during initial connection: {}", e);
-                            let _ = s
-                                        .api
-                                        .call(
-                                            act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                                        )
-                                        .await;
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Initial connection failed: {}", e);
+                let connect_fut = async {
+                    let conn = endpoint.connect(endpoint_id, crate::Direct::ALPN).await?;
+                    let (send, recv) = conn.open_bi().await?;
+                    Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
+                };
+
+                match tokio::time::timeout(CONNECTING_TIMEOUT, connect_fut).await {
+                    Ok(Ok((conn, send, recv))) => {
+                        let _ = s.incoming_connection(conn, send, recv).await;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Initial connection to {} failed: {}", endpoint_id, e);
                         let _ = s
-                                .api
-                                .call(
-                                    act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                                )
-                                .await;
+                            .api
+                            .call(
+                                act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
+                            )
+                            .await;
+                    }
+                    Err(_) => {
+                        warn!("Initial connection to {} timed out after {}s", endpoint_id, CONNECTING_TIMEOUT.as_secs());
+                        let _ = s
+                            .api
+                            .call(
+                                act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
+                            )
+                            .await;
                     }
                 }
             }
@@ -211,6 +212,9 @@ impl Actor<anyhow::Error> for ConnActor {
         debug!("ConnActor started for peer: {}", self.conn_endpoint_id);
 
         loop {
+            if self.state == ConnState::Closed {
+                break;
+            }
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => {
                     action(self).await;
@@ -218,9 +222,8 @@ impl Actor<anyhow::Error> for ConnActor {
                 _ = reconnect_ticker.tick(), if self.state != ConnState::Closed => {
 
                     let connecting = self.state == ConnState::Connecting;
-                    let need_reconnect = !connecting && (
-                        self.state == ConnState::Disconnected
-                        || self.write_task.as_ref().map(|t| t.is_finished()).unwrap_or(true)
+                    let need_reconnect = !connecting && 
+                        (self.write_task.as_ref().map(|t| t.is_finished()).unwrap_or(true)
                         || self.read_task.as_ref().map(|t| t.is_finished()).unwrap_or(true)
                         || self.conn.as_ref().and_then(|c| c.close_reason()).is_some()
                     );
@@ -339,7 +342,7 @@ impl ConnActor {
             conn,
             endpoint,
             last_reconnect: tokio::time::Instant::now(),
-            reconnect_backoff: Duration::from_millis(100),
+            reconnect_backoff: Duration::from_millis(500),
             conn_endpoint_id,
             self_handle,
             reconnect_count: AtomicUsize::new(0),
@@ -463,7 +466,7 @@ impl ConnActor {
         info!("Incoming connection from: {}", conn.remote_id());
         if conn.close_reason().is_some() {
             warn!("Incoming connection already closed");
-            self.state = ConnState::Closed;
+            self.state = ConnState::Disconnected;
             return Err(anyhow::anyhow!("connection closed"));
         }
 
@@ -499,6 +502,10 @@ impl ConnActor {
         self.set_state(ConnState::Open);
         self.reconnect_backoff = RECONNECT_BACKOFF_BASE;
         self.consecutive_write_errors = 0;
+        self.rx_count = 0;
+        self.tx_count = 0;
+        self.last_rx = Instant::now();
+        self.last_tx = Instant::now();
 
         while let Some(msg) = self.sender_queue.pop_back() {
             match tx.try_send(msg) {
@@ -529,6 +536,8 @@ impl ConnActor {
             warn!("Cannot reconnect, actor is closed");
             return Err(anyhow::anyhow!("actor closed for good"));
         }
+        self.state = ConnState::Connecting;
+
         if let Some(task) = self.read_task.take() {
             task.abort();
         }
@@ -553,34 +562,44 @@ impl ConnActor {
             let conn_node_id = self.conn_endpoint_id;
             async move {
                 debug!("Initiating reconnection to {}", conn_node_id);
-                if let Ok(conn) = endpoint.connect(conn_node_id, crate::Direct::ALPN).await {
-                    debug!("Reconnection successful");
-                    match conn.open_bi().await {
-                        Ok((send, recv)) => {
-                            let _ = api
-                                .call(act!(actor => actor.incoming_connection(conn, send, recv)))
-                                .await;
-                            let _ = api
-                                .call(act_ok!(actor => async move { actor.reconnect_count.store(0, std::sync::atomic::Ordering::SeqCst) }))
-                                .await;
-                        }
-                        Err(e) => {
-                            warn!("Failed to open bi-stream during reconnection: {}", e);
-                            let _ = api
-                                .call(
-                                    act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                                )
-                                .await;
-                        }
+                let connect_fut = async {
+                    let conn = endpoint.connect(conn_node_id, crate::Direct::ALPN).await?;
+                    let (send, recv) = conn.open_bi().await?;
+                    Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
+                };
+
+                match tokio::time::timeout(CONNECTING_TIMEOUT, connect_fut).await {
+                    Ok(Ok((conn, send, recv))) => {
+                        debug!("Reconnection successful");
+                        let _ = api
+                            .call(act!(actor => actor.incoming_connection(conn, send, recv)))
+                            .await;
+                        let _ = api
+                            .call(act_ok!(actor => async move { actor.reconnect_count.store(0, std::sync::atomic::Ordering::SeqCst) }))
+                            .await;
                     }
-                } else {
-                    warn!("Reconnection failed");
-                    let _ = api.call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) })).await;
-                    let _ = api
-                        .call(
-                            act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                        )
-                        .await;
+                    Ok(Err(e)) => {
+                        warn!("Reconnection to {} failed: {}", conn_node_id, e);
+                        let _ = api
+                            .call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) }))
+                            .await;
+                        let _ = api
+                            .call(
+                                act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
+                            )
+                            .await;
+                    }
+                    Err(_) => {
+                        warn!("Reconnection to {} timed out after {}s", conn_node_id, CONNECTING_TIMEOUT.as_secs());
+                        let _ = api
+                            .call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) }))
+                            .await;
+                        let _ = api
+                            .call(
+                                act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
+                            )
+                            .await;
+                    }
                 }
             }
         });
@@ -632,9 +651,9 @@ async fn write_loop_bounded(
             }
         }
 
-        let _ = api
+        /*let _ = api
             .call(act_ok!(actor => async move { actor.note_tx(); }))
-            .await;
+            .await;*/
     }
     info!("Write task stopped ({})", label);
 }
@@ -648,9 +667,9 @@ async fn retry_read_loop(
     loop {
         match read_next_msg(&mut stream).await {
             Ok(msg) => {
-                let _ = api
+                /*let _ = api
                     .call(act_ok!(actor => async move { actor.note_rx(); }))
-                    .await;
+                    .await;*/
                 trace!("Read message from stream, forwarding to network actor");
                 let start = std::time::Instant::now();
                 if let Err(e) = sender.send(msg).await {

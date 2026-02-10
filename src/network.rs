@@ -92,7 +92,7 @@ impl Network {
             .hooks(auth.clone())
             .hooks(topic_discovery_hook.clone())
             .secret_key(secret_key.clone())
-            .transport_config(transport_config())
+            //.transport_config(transport_config())
             .bind()
             .await?;
         auth.set_endpoint(&endpoint);
@@ -238,14 +238,17 @@ impl Actor<anyhow::Error> for NetworkActor {
                                         self.tun_ip_debug = Some(ip);
                                         self.tun = Some(tun);
                                         if let Ok(peers) = self.router.get_peers().await {
-                                            for (id, _) in peers {
-                                                info!("Ensuring direct connection after IP assignment: {}", id);
-                                                let direct = self.direct.clone();
-                                                tokio::spawn(async move {
-                                                    if let Err(e) = direct.ensure_connection(id).await {
-                                                        warn!("Failed to ensure connection to {}: {}", id, e);
-                                                    }
-                                                });
+                                            for (id, remote_ip) in peers {
+                                                if remote_ip.is_some() {
+                                                    info!("Ensuring direct connection after IP assignment: {}", id);
+                                                    let direct = self.direct.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Err(e) = direct.ensure_connection(id).await {
+                                                            warn!("Failed to ensure connection to {}: {}", id, e);
+                                                        }
+                                                    });
+                                                }
+
                                             }
                                         }
                                     }
