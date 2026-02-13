@@ -6,6 +6,7 @@ services:
     image: iroh-lan-test
     cap_add:
       - NET_ADMIN
+      - SYS_PTRACE
     devices:
       - /dev/net/tun:/dev/net/tun
     command: ["server"]
@@ -30,6 +31,7 @@ services:
     image: iroh-lan-test
     cap_add:
       - NET_ADMIN
+      - SYS_PTRACE
     devices:
       - /dev/net/tun:/dev/net/tun
     command: ["client"]

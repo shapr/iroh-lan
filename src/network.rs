@@ -1,16 +1,14 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
-use iroh::{Endpoint, EndpointId, SecretKey, endpoint::QuicTransportConfig};
+use iroh::{Endpoint, EndpointId, SecretKey, endpoint::{IdleTimeout, QuicTransportConfig, VarInt}};
 use iroh_auth::Authenticator;
 
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
-use iroh_quinn_proto::{IdleTimeout, VarInt, congestion};
 use iroh_topic_tracker::TopicDiscoveryHook;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
@@ -71,7 +69,6 @@ fn transport_config() -> QuicTransportConfig {
         .min_mtu(1200)
         .mtu_discovery_config(None)
         .persistent_congestion_threshold(5)
-        .congestion_controller_factory(Arc::new(congestion::BbrConfig::default()))
         .datagram_receive_buffer_size(Some(STREAM_RWND as usize))
         .datagram_send_buffer_size(STREAM_RWND as usize)
         .build()
@@ -97,13 +94,24 @@ impl Network {
             .await?;
         auth.set_endpoint(&endpoint);
 
-        let gossip_config = HyparviewConfig {
-            neighbor_request_timeout: Duration::from_millis(2000),
+        let gossip_hyparview_config = HyparviewConfig {
+            neighbor_request_timeout: Duration::from_millis(3000),
+            shuffle_interval: Duration::from_secs(120),
+            ..Default::default()
+        };
+
+        let gossip_plumtree_config = iroh_gossip::proto::PlumtreeConfig {
+            message_cache_retention: Duration::from_secs(300),
+            cache_evict_interval: Duration::from_secs(60),
+            message_id_retention: Duration::from_secs(300),
+            graft_timeout_1: Duration::from_secs(2),
+            graft_timeout_2: Duration::from_secs(1),
             ..Default::default()
         };
 
         let gossip = Gossip::builder()
-            .membership_config(gossip_config)
+            .membership_config(gossip_hyparview_config)
+            .broadcast_config(gossip_plumtree_config)
             .spawn(endpoint.clone());
 
         let (direct_connect_tx, direct_connect_rx) = tokio::sync::mpsc::channel(1024 * 16);

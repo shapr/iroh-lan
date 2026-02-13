@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     netcat-openbsd \
     iputils-ping \
     iperf3 \
+    gdb \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY entrypoint_stress.sh /app/entrypoint_stress.sh

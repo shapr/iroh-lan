@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt;
-use iroh::PublicKey;
+use iroh::{EndpointId, PublicKey};
 use iroh_gossip::api::{GossipReceiver, GossipSender};
 use n0_watcher::Watchable;
 use rand::Rng;
@@ -62,6 +62,7 @@ pub struct Kv {
 
 #[derive(Debug)]
 struct KvInner {
+    endpoint_id: EndpointId,
     store: Mutex<BTreeMap<String, u64>>,
     sender: GossipSender,
     updates: broadcast::Sender<KvEvent>,
@@ -71,10 +72,11 @@ impl Kv {
     ///
     /// `receiver` is consumed, the worker exclusively owns the gossip
     /// receive side.
-    pub fn spawn(sender: GossipSender, receiver: GossipReceiver) -> Self {
+    pub fn spawn(endpoint_id: EndpointId, sender: GossipSender, receiver: GossipReceiver) -> Self {
         let (updates_tx, _) = broadcast::channel(512);
 
         let inner = Arc::new(KvInner {
+            endpoint_id,
             store: Mutex::new(BTreeMap::new()),
             sender,
             updates: updates_tx,
@@ -232,6 +234,7 @@ impl Kv {
 const JITTER_MIN_MS: u64 = 200;
 const JITTER_MAX_MS: u64 = 2_000;
 const PERIODIC_SYNC_SECS: u64 = 30;
+const DIAGNOSTIC_LOG_SECS: u64 = 10;
 const PEER_DISCONNECT_BACKOFF_INIT_SECS: u64 = 2;
 const PEER_DISCONNECT_BACKOFF_INC_SECS: u64 = 2;
 const PEER_DISCONNECT_MAX_BACKOFF_SECS: u64 = 30;
@@ -243,16 +246,25 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
     let mut state_timer: Pin<Box<tokio::time::Sleep>> =
         Box::pin(tokio::time::sleep(Duration::from_secs(86400)));
     let mut state_pending = false;
+    let mut received_count: u64 = 0;
+    let mut neighbor_up_count: u64 = 0;
+    let mut neighbor_down_count: u64 = 0;
+    let mut lagged_count: u64 = 0;
+    let mut stream_error_count: u64 = 0;
+    let mut decode_error_count: u64 = 0;
 
     let mut periodic = tokio::time::interval(Duration::from_secs(PERIODIC_SYNC_SECS));
     periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut diagnostics = tokio::time::interval(Duration::from_secs(DIAGNOSTIC_LOG_SECS));
+    diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let init_peers = receiver
         .neighbors()
         .map(|peer| (peer, None))
         .collect::<BTreeMap<_, _>>();
     let peer_disconnect_timings = Watchable::new(init_peers);
-
+    
     // On startup, schedule an initial state broadcast so any existing peers
     // learn about keys we may have inserted before the worker started.
     schedule_state(&mut state_timer, &mut state_pending);
@@ -261,9 +273,14 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
             event = receiver.next() => {
                 match event {
                     Some(Ok(Event::Received(msg))) => {
-                        handle_received(&kv, &msg.content, &mut state_pending).await;
+                        received_count += 1;
+                        info!("[Kv] Received gossip message from {}: {:?}", msg.delivered_from, msg.content);
+                        if !handle_received(&kv, &msg.content, &mut state_pending).await {
+                            decode_error_count += 1;
+                        }
                     }
                     Some(Ok(Event::NeighborUp(peer))) => {
+                        neighbor_up_count += 1;
                         let mut peers = peer_disconnect_timings.get();
                         peers.insert(peer, None);
                         peer_disconnect_timings.set(peers).ok();
@@ -272,6 +289,7 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
                         schedule_state(&mut state_timer, &mut state_pending);
                     }
                     Some(Ok(Event::NeighborDown(peer))) => {
+                        neighbor_down_count += 1;
                         let mut peers = peer_disconnect_timings.get();
                         peers.insert(peer, Some(Instant::now()));
                         peer_disconnect_timings.set(peers).ok();
@@ -279,10 +297,14 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
                         debug!("[Kv] NeighborDown: {}", peer);
                     }
                     Some(Ok(Event::Lagged)) => {
+                        lagged_count += 1;
                         warn!("[Kv] Gossip lagged, scheduling state broadcast");
                         schedule_state(&mut state_timer, &mut state_pending);
                     }
-                    Some(Err(e)) => warn!("[Kv] gossip stream error: {}", e),
+                    Some(Err(e)) => {
+                        stream_error_count += 1;
+                        warn!("[Kv] gossip stream error: {}", e);
+                    }
                     None => {
                         warn!("[Kv] gossip stream ended, exiting worker");
                     }
@@ -294,6 +316,23 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
             }
             _ = periodic.tick() => {
                 schedule_state(&mut state_timer, &mut state_pending);
+            }
+            _ = diagnostics.tick() => {
+                let neighbors = receiver.neighbors().count();
+                let store_len = kv.inner.store.lock().await.len();
+                info!(
+                    "[KvDiag] endpoint={} neighbors={} store={} recv={} up={} down={} lagged={} stream_err={} decode_err={} state_pending={}",
+                    kv.inner.endpoint_id,
+                    neighbors,
+                    store_len,
+                    received_count,
+                    neighbor_up_count,
+                    neighbor_down_count,
+                    lagged_count,
+                    stream_error_count,
+                    decode_error_count,
+                    state_pending,
+                );
             }
         }
     }
@@ -350,12 +389,12 @@ fn schedule_state(timer: &mut Pin<Box<tokio::time::Sleep>>, pending: &mut bool) 
 /// have (same keys, same or newer timestamps).  If we have keys or newer
 /// timestamps that the remote is missing, we keep the pending broadcast so
 /// the remote learns about our state.
-async fn handle_received(kv: &Kv, raw: &[u8], state_pending: &mut bool) {
+async fn handle_received(kv: &Kv, raw: &[u8], state_pending: &mut bool) -> bool {
     let msg: Message = match postcard::from_bytes(raw) {
         Ok(m) => m,
         Err(e) => {
-            trace!("[Kv] ignoring unparseable gossip message: {}", e);
-            return;
+            warn!("[Kv] ignoring unparseable gossip message (len={}): {}", raw.len(), e);
+            return false;
         }
     };
 
@@ -410,6 +449,8 @@ async fn handle_received(kv: &Kv, raw: &[u8], state_pending: &mut bool) {
             }
         }
     }
+
+    true
 }
 
 fn now_millis() -> u64 {

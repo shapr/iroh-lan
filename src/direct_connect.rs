@@ -7,7 +7,7 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, hash_map::Entry};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use crate::{Router, RouterIp, connection::Conn, local_networking::Ipv4Pkg};
 
@@ -108,7 +108,7 @@ impl DirectActor {
                     action(self).await;
                 }
                 _ = cleanup_interval.tick() => {
-                    self.prune_closed_connections().await;
+                    //self.prune_closed_connections().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                      info!("Ctrl-C received, shutting down DirectActor");
@@ -155,17 +155,6 @@ impl DirectActor {
                 remote_id
             );
         }
-        if let Some(conn_ref) = self.peers.get(&remote_id) {
-            let state = conn_ref.get_state().await;
-            if state == crate::connection::ConnState::Open {
-                warn!(
-                    "Race Condition: Rejecting incoming connection from {} (Existing state: {:?})",
-                    remote_id, state
-                );
-                conn.close(VarInt::from_u32(409), b"duplicate connection");
-                return Ok(());
-            }
-        }
 
         let api = self.self_handle.clone();
 
@@ -198,28 +187,13 @@ impl DirectActor {
 
         match self.peers.entry(remote_id) {
             Entry::Occupied(mut entry) => {
-                let state = entry.get().get_state().await;
-                if state != crate::connection::ConnState::Open {
-                    if state != crate::connection::ConnState::Open {
-                        info!(
-                            "Replacing existing connection to {} in state {:?}",
-                            remote_id, state
-                        );
-                    }
-                    debug!(
-                        "Existing connection found for {}, upgrading/resetting",
-                        remote_id
-                    );
+                debug!(
+                    "Existing connection found for {}, upgrading/resetting",
+                    remote_id
+                );
 
-                    if let Err(e) = entry.get_mut().incoming_connection(conn, send, recv).await {
-                        error!("Failed to upgrade connection to {}: {}", remote_id, e);
-                    }
-                } else {
-                    info!(
-                        "Ignoring incoming connection from {} (keeping existing connection) - Race detected",
-                        remote_id
-                    );
-                    conn.close(VarInt::from_u32(409), b"duplicate connection");
+                if let Err(e) = entry.get_mut().incoming_connection(conn, send, recv).await {
+                    error!("Failed to upgrade connection to {}: {}", remote_id, e);
                 }
             }
             Entry::Vacant(entry) => {

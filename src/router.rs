@@ -94,6 +94,7 @@ impl Builder {
         let topic_discovery_config =
             TopicDiscoveryConfig::builder(signing_key, self.topic_discovery_hook.clone())
                 .connection_timeout(Duration::from_secs(15))
+                .announce_interval(Duration::from_secs(15*60))
                 .dht_retries(None)
                 .build();
         let (gossip_sender, gossip_receiver, topic_handle) = loop {
@@ -114,7 +115,7 @@ impl Builder {
 
         info!("Joined topic with hash: {:x?}", topic_hash);
 
-        let kv = Kv::spawn(gossip_sender, gossip_receiver);
+        let kv = Kv::spawn(endpoint.id(), gossip_sender, gossip_receiver);
 
         let (api, rx) = Handle::channel();
         tokio::spawn(async move {
@@ -231,9 +232,9 @@ impl Actor<anyhow::Error> for RouterActor {
 
         let mut last_ip_state = self.my_ip.clone();
 
+        let mut kv_sub = self.kv.subscribe();
         self.populate_from_kv().await;
 
-        let mut kv_sub = self.kv.subscribe();
 
         loop {
             tokio::select! {
@@ -267,7 +268,7 @@ impl Actor<anyhow::Error> for RouterActor {
                         // Write our startup entry (immediately broadcast via gossip).
                         let startup_key = format!("{}{}", key_startup_prefix(), self.endpoint_id);
                         trace!("[ROUTER_LOOP] Calling kv.insert for startup");
-                        self.kv.insert(startup_key).await;
+                        self.kv.insert(&startup_key).await;
                         trace!("[ROUTER_LOOP] kv.insert completed");
                         trace!("Not advancing IP state, waiting for startup entries. Current count: {}", self.startup_entries.len());
                         continue;
