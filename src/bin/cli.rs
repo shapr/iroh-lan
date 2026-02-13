@@ -4,8 +4,17 @@ use std::sync::Arc;
 
 const WORKERS: usize = 32;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
 
+    if !self_runas::is_elevated() {
+        self_runas::admin()?;
+        return Ok(());
+    }
+
+    return iroh_lan::cli::run_cli().await
+
+    /*
     let last_tokio_tick = Arc::new(AtomicU64::new(0));
     let tick_for_watchdog = last_tokio_tick.clone();
 
@@ -113,18 +122,6 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKERS)
         .thread_name("iroh-worker")
-        .on_thread_start(|| {
-            eprintln!(
-                "[THREAD_START] Worker thread {} started",
-                std::thread::current().name().unwrap()
-            );
-        })
-        .on_thread_stop(|| {
-            eprintln!(
-                "[THREAD_STOP] Worker thread {} stopped",
-                std::thread::current().name().unwrap()
-            );
-        })
         .enable_all()
         .build()
         .unwrap()
@@ -144,4 +141,5 @@ fn main() -> Result<()> {
             });
             iroh_lan::cli::run_cli().await
         })
+        */
 }

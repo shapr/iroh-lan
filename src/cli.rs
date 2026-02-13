@@ -45,12 +45,7 @@ pub async fn run_cli() -> Result<()> {
     if args.name.is_empty() {
         anyhow::bail!("Network name is required")
     }
-
-    if !self_runas::is_elevated() {
-        self_runas::admin()?;
-        return Ok(());
-    }
-
+    
     if args.trace {
         use tracing_subscriber::{EnvFilter, fmt, prelude::*};
         tracing_subscriber::registry()
