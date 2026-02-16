@@ -49,9 +49,9 @@ iroh = { git = "https://github.com/n0-computer/iroh", rev = "3a45cd0f1bd17b3b0af
 iroh-base = { git = "https://github.com/n0-computer/iroh", rev = "3a45cd0f1bd17b3b0aff81a263b6686b0eb5b837" }
 iroh-relay = { git = "https://github.com/n0-computer/iroh", rev = "3a45cd0f1bd17b3b0aff81a263b6686b0eb5b837" }
 iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "c1ad5da464e0238425b29be748478d027ea0b878" }
-quinn = { git="https://github.com/n0-computer/quinn", rev="315f491bfbdd0bb04fb8cdb43967b40bfef83d22", package = "iroh-quinn" }
-quinn-proto = { git="https://github.com/n0-computer/quinn", rev="315f491bfbdd0bb04fb8cdb43967b40bfef83d22", package = "iroh-quinn-proto" }
-quinn-udp = { git="https://github.com/n0-computer/quinn", rev="315f491bfbdd0bb04fb8cdb43967b40bfef83d22", package = "iroh-quinn-udp" }
+quinn = { git="https://github.com/rustonbsd/quinn", rev="b7fe4ccd08d7d3919923d95d40ebeb07216babea", package = "iroh-quinn" }
+quinn-proto = { git="https://github.com/rustonbsd/quinn", rev="b7fe4ccd08d7d3919923d95d40ebeb07216babea", package = "iroh-quinn-proto" }
+quinn-udp = { git="https://github.com/rustonbsd/quinn", rev="b7fe4ccd08d7d3919923d95d40ebeb07216babea", package = "iroh-quinn-udp" }
 
 [lib]
 path = "src/lib.rs"
