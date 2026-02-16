@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
 
 use crate::DirectMessage;
@@ -8,25 +10,21 @@ use iroh::{
     Endpoint, EndpointId,
     endpoint::{RecvStream, SendStream},
 };
-use tokio::io::AsyncReadExt;
-use tokio::time::{self, Instant};
+use n0_watcher::Watchable;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{self};
 use tracing::{debug, info, trace, warn};
 
 const QUEUE_SIZE: usize = 1024 * 16;
-const MAX_RECONNECTS: usize = 100;
-const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const BACKPRESSURE_WARN_MS: u128 = 5;
-const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SENDER_QUEUE: usize = 50_000;
 const WRITE_CHANNEL_CAP: usize = 8_192;
-const MAX_CONSECUTIVE_WRITE_ERRORS: u64 = 3;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const QUEUE_WARN_LEN: usize = 10_000;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECTING_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conn {
     api: Handle<ConnActor, anyhow::Error>,
 }
@@ -34,17 +32,18 @@ pub struct Conn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
     Connecting, // ConnActor::connect() called, waiting for connection to be established (in background)
-    Idle,       // no active connection, can be connected
     Open,       // open bi directional streams
     Closed,     // connection closed by user or error
     Disconnected, // connection closed by remote peer, can be recovered within 5 retries after Closed
+    ClosedAndStopped, // connection closed and actor stopped, no recovery possible
 }
 
 #[derive(Debug)]
 struct ConnActor {
     rx: Receiver<Action<ConnActor>>,
     self_handle: Handle<ConnActor, anyhow::Error>,
-    state: ConnState,
+    state: Watchable<ConnState>,
+    local_endpoint_id: EndpointId,
 
     // all of these need to be optionals so that we can create an empty
     // shell of the actor and then fill in the values later so we don't wait
@@ -52,11 +51,6 @@ struct ConnActor {
     // route_packet failed
     conn: Option<Connection>,
     conn_endpoint_id: EndpointId,
-    endpoint: Endpoint,
-
-    last_reconnect: tokio::time::Instant,
-    reconnect_backoff: Duration,
-    reconnect_count: AtomicUsize,
 
     external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
 
@@ -64,144 +58,203 @@ struct ConnActor {
     write_tx: Option<tokio::sync::mpsc::Sender<DirectMessage>>,
 
     read_task: Option<tokio::task::JoinHandle<()>>,
+    closed_task: Option<tokio::task::JoinHandle<()>>,
 
-    queue_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    dropped_packets: u64,
+    queue_len: Arc<std::sync::atomic::AtomicUsize>,
+    dropped_packets: Arc<AtomicUsize>,
 
     sender_queue: VecDeque<DirectMessage>,
-    last_rx: Instant,
-    last_tx: Instant,
-    rx_count: u64,
-    tx_count: u64,
-    write_timeouts: u64,
-    consecutive_write_errors: u64,
+    rx_count: Arc<AtomicUsize>,
+    tx_count: Arc<AtomicUsize>,
+    write_timeouts: Arc<AtomicUsize>,
+    consecutive_write_errors: Arc<AtomicUsize>,
+    conn_generation: usize,
+    remote_generation: Watchable<Option<usize>>,
 }
 
 impl Conn {
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
-        endpoint: Endpoint,
+    pub async fn accept_connection(
         conn: iroh::endpoint::Connection,
-        send_stream: SendStream,
-        recv_stream: RecvStream,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
+        generation: Option<usize>,
+        local_endpoint_id: EndpointId,
     ) -> Result<Self> {
+        info!("[CONN] Accepting incoming gen: {generation:?}");
         let (api, rx) = Handle::channel();
         let mut actor = ConnActor::new(
             rx,
             api.clone(),
             external_sender,
-            endpoint,
             conn.remote_id(),
-            Some(conn),
-            Some(send_stream),
-            Some(recv_stream),
+            local_endpoint_id,
+            generation,
         )
         .await;
-        tokio::spawn(async move { actor.run().await });
-        Ok(Self { api })
-    }
 
-    pub async fn connect(
-        endpoint: Endpoint,
-        endpoint_id: EndpointId,
-        external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
-    ) -> Self {
-        let (api, rx) = Handle::channel();
-        let mut actor = ConnActor::new(
-            rx,
-            api.clone(),
-            external_sender,
-            endpoint.clone(),
-            endpoint_id,
-            None,
-            None,
-            None,
-        )
-        .await;
+        let s = Self { api };
 
         tokio::spawn(async move {
-            actor.set_state(ConnState::Connecting);
+            actor.state.set(ConnState::Connecting).ok();
+            actor.run().await
+        });
+
+        let remote_id = conn.remote_id();
+        let connect_fut = async {
+            let (send, recv) = conn.accept_bi().await?;
+            Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
+        };
+
+        match tokio::time::timeout(CONNECTING_TIMEOUT, connect_fut).await {
+            Ok(Ok((conn, send, recv))) => {
+                if let Err(err) = s.establish_connection(conn, send, recv).await {
+                    warn!("Failed to establish connection with {}: {}", remote_id, err);
+                    s.drop().await;
+                    anyhow::bail!("Failed to establish connection: {}", err);
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Initial connection to {} failed: {}", remote_id, e);
+                s.drop().await;
+                anyhow::bail!("Failed to establish connection: {}", e);
+            }
+            Err(_) => {
+                warn!(
+                    "Initial connection to {} timed out after {}s",
+                    remote_id,
+                    CONNECTING_TIMEOUT.as_secs()
+                );
+                s.drop().await;
+                anyhow::bail!("Connection timed out");
+            }
+        }
+
+        Ok(s)
+    }
+
+    pub async fn open_connection(
+        endpoint: Endpoint,
+        remote_endpoint_id: EndpointId,
+        local_endpoint_id: EndpointId,
+        external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
+        generation: Option<usize>,
+
+    ) -> Result<Self> {
+        info!("[CONN] Opening incoming gen: {generation:?}");
+        let (api, rx) = Handle::channel();
+        let mut actor =
+            ConnActor::new(rx, api.clone(), external_sender, remote_endpoint_id, local_endpoint_id, generation).await;
+
+        tokio::spawn(async move {
+            actor.state.set(ConnState::Connecting).ok();
             actor.run().await
         });
         let s = Self { api };
 
-        tokio::spawn({
-            let s = s.clone();
-            async move {
-                let connect_fut = async {
-                    let conn = endpoint.connect(endpoint_id, crate::Direct::ALPN).await?;
-                    let (send, recv) = conn.open_bi().await?;
-                    Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
-                };
+        let connect_fut = async {
+            let conn = endpoint.connect(remote_endpoint_id, crate::Direct::ALPN).await?;
+            let (send, recv) = conn.open_bi().await?;
+            Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
+        };
 
-                match tokio::time::timeout(CONNECTING_TIMEOUT, connect_fut).await {
-                    Ok(Ok((conn, send, recv))) => {
-                        let _ = s.incoming_connection(conn, send, recv).await;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Initial connection to {} failed: {}", endpoint_id, e);
-                        let _ = s
-                            .api
-                            .call(
-                                act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                            )
-                            .await;
-                    }
-                    Err(_) => {
-                        warn!("Initial connection to {} timed out after {}s", endpoint_id, CONNECTING_TIMEOUT.as_secs());
-                        let _ = s
-                            .api
-                            .call(
-                                act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }),
-                            )
-                            .await;
-                    }
+        match tokio::time::timeout(CONNECTING_TIMEOUT, connect_fut).await {
+            Ok(Ok((conn, send, recv))) => {
+                if let Err(err) = s.establish_connection(conn, send, recv).await {
+                    warn!("Failed to establish connection with {}: {}", remote_endpoint_id, err);
+                    s.drop().await;
+                    anyhow::bail!("Failed to establish connection: {}", err);
                 }
             }
-        });
+            Ok(Err(e)) => {
+                warn!("Initial connection to {} failed: {}", remote_endpoint_id, e);
+                s.drop().await;
+                anyhow::bail!("Failed to establish connection: {}", e);
+            }
+            Err(_) => {
+                warn!(
+                    "Initial connection to {} timed out after {}s",
+                    remote_endpoint_id,
+                    CONNECTING_TIMEOUT.as_secs()
+                );
+                s.drop().await;
+                anyhow::bail!("Connection timed out");
+            }
+        }
 
-        s
+        Ok(s)
     }
 
-    pub async fn get_state(&self) -> ConnState {
+    pub async fn get_state(&self) -> Watchable<ConnState> {
         if let Ok(state) = self
             .api
             .call(act_ok!(actor => async move {
-                actor.state
+                actor.state.clone()
             }))
             .await
         {
             state
         } else {
-            ConnState::Closed
+            Watchable::new(ConnState::ClosedAndStopped)
         }
     }
 
-    pub async fn close(&self) -> Result<()> {
-        self.api.call(act_ok!(actor => actor.close())).await
-    }
+    /*
+    pub async fn get_conn(&self) -> Option<Connection> {
+        self.api
+            .call(act_ok!(actor => async {
+                actor.conn.clone()
+            }))
+            .await
+            .unwrap_or_default()
+    } */
 
     pub async fn write(&self, pkg: DirectMessage) -> Result<()> {
         self.api.call(act_ok!(actor => actor.write(pkg))).await
     }
 
-    pub async fn incoming_connection(
+    pub async fn establish_connection(
         &self,
         conn: Connection,
         send_stream: SendStream,
         recv_stream: RecvStream,
     ) -> Result<()> {
         self.api
-            .call(act!(actor => actor.incoming_connection(conn, send_stream, recv_stream)))
+            .call(act!(actor => actor.establish_connection(conn, send_stream, recv_stream)))
             .await
+    }
+
+    pub async fn get_generation(&self) -> usize {
+        self.api
+            .call(act_ok!(actor => async {
+                actor.conn_generation
+            }))
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn get_remote_generation(&self) -> Option<usize> {
+        self.api
+            .call(act_ok!(actor => async {
+                actor.remote_generation.get()
+            }))
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn drop(&self) {
+        self.api.call(act_ok!(actor => async {
+                actor.close().await;
+                actor.state.set(ConnState::ClosedAndStopped).ok();
+            }))
+            .await
+            .ok();
     }
 }
 
 impl Actor<anyhow::Error> for ConnActor {
     async fn run(&mut self) -> Result<()> {
-        let mut reconnect_ticker = tokio::time::interval(Duration::from_millis(500));
-        reconnect_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        //let mut reconnect_ticker = tokio::time::interval(Duration::from_millis(500));
+        //reconnect_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut keepalive_ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
         keepalive_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -212,24 +265,28 @@ impl Actor<anyhow::Error> for ConnActor {
         debug!("ConnActor started for peer: {}", self.conn_endpoint_id);
 
         loop {
-            if self.state == ConnState::Closed {
+            if self.state.get() == ConnState::ClosedAndStopped {
+                debug!(
+                    "ConnActor for {} is in ClosedAndStopped state, exiting run loop",
+                    self.conn_endpoint_id
+                );
                 break;
             }
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => {
                     action(self).await;
                 }
-                _ = reconnect_ticker.tick(), if self.state != ConnState::Closed => {
+                /*_ = reconnect_ticker.tick(), if self.state != ConnState::Closed => {
 
-                    let connecting = self.state == ConnState::Connecting;
-                    let need_reconnect = !connecting && 
-                        (self.write_task.as_ref().map(|t| t.is_finished()).unwrap_or(true)
-                        || self.read_task.as_ref().map(|t| t.is_finished()).unwrap_or(true)
+                    let need_reconnect = !matches!(self.state, ConnState::Open | ConnState::Connecting) &&
+                        (self.write_task.as_ref().map(|t| t.is_finished()).unwrap_or(false)
+                        || self.read_task.as_ref().map(|t| t.is_finished()).unwrap_or(false)
                         || self.conn.as_ref().and_then(|c| c.close_reason()).is_some()
+                        || self.closed_task.as_ref().map(|t| t.is_finished()).unwrap_or(false)
                     );
 
                     if need_reconnect && self.last_reconnect.elapsed() > self.reconnect_backoff {
-                        if self.reconnect_count.load(std::sync::atomic::Ordering::SeqCst) < MAX_RECONNECTS {
+                        if self.reconnect_count.load(Ordering::SeqCst) < MAX_RECONNECTS {
                             warn!("Write task finished or connection issues detected. Attempting reconnect.");
                             let _ = self.try_reconnect().await;
                         } else {
@@ -237,42 +294,40 @@ impl Actor<anyhow::Error> for ConnActor {
                             break;
                         }
                     }
-                }
-                _ = keepalive_ticker.tick(), if self.state == ConnState::Open => {
+                }*/
+                _ = keepalive_ticker.tick(), if self.state.get() == ConnState::Open => {
                     if let Some(tx) = &self.write_tx {
                         match tx.try_send(DirectMessage::IDontLikeWarnings) {
                             Ok(_) => {
-                                let new_len = self.queue_len.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                let new_len = self.queue_len.fetch_add(1, Ordering::Relaxed) + 1;
                                 if new_len > QUEUE_WARN_LEN {
                                     warn!("Stream queue length high (keepalive): {}", new_len);
                                 }
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                self.dropped_packets = self.dropped_packets.saturating_add(1);
+                                self.dropped_packets.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                self.dropped_packets = self.dropped_packets.saturating_add(1);
+                                self.dropped_packets.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
                 }
                 _ = stats_ticker.tick() => {
-                    let q_len = self.queue_len.load(std::sync::atomic::Ordering::Relaxed);
+                    let q_len = self.queue_len.load(Ordering::Relaxed);
                     if q_len > 100 {
                         warn!("[PROBE-QUEUE] High Queue Len: {}", q_len);
                     }
                     debug!(
-                        "Conn stats: endpoint_id={} state={:?} last_rx={:?} last_tx={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
+                        "Conn stats: endpoint_id={} state={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
                         self.conn_endpoint_id,
-                        self.state,
-                        self.last_rx.elapsed(),
-                        self.last_tx.elapsed(),
-                        self.rx_count,
-                        self.tx_count,
-                        self.queue_len.load(std::sync::atomic::Ordering::Relaxed),
-                        self.write_timeouts,
-                        self.consecutive_write_errors,
-                        self.dropped_packets
+                        self.state.get(),
+                        self.rx_count.load(Ordering::Relaxed),
+                        self.tx_count.load(Ordering::Relaxed),
+                        self.queue_len.load(Ordering::Relaxed),
+                        self.write_timeouts.load(Ordering::Relaxed),
+                        self.consecutive_write_errors.load(Ordering::Relaxed),
+                        self.dropped_packets.load(Ordering::Relaxed)
                     );
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -281,94 +336,61 @@ impl Actor<anyhow::Error> for ConnActor {
                 }
             }
         }
-        self.close().await;
         Ok(())
     }
 }
 
 impl ConnActor {
+    fn spawn_closed_task(
+        api: Handle<ConnActor, anyhow::Error>,
+        conn: Connection,
+        generation: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _reason = conn.closed().await;
+            let _ = api
+                .call(act_ok!(actor => async move {
+                    actor.handle_connection_closed(generation).await;
+                }))
+                .await;
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         rx: Receiver<Action<ConnActor>>,
         self_handle: Handle<ConnActor, anyhow::Error>,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
-        endpoint: Endpoint,
         conn_endpoint_id: EndpointId,
-        conn: Option<iroh::endpoint::Connection>,
-        send_stream: Option<SendStream>,
-        mut recv_stream: Option<RecvStream>,
+        local_endpoint_id: EndpointId,
+        generation: Option<usize>,
     ) -> Self {
-        let mut read_task = None;
-        if let Some(recv) = recv_stream.take() {
-            info!("Spawning read task immediately in new");
-            let task = tokio::spawn(retry_read_loop(
-                recv,
-                external_sender.clone(),
-                self_handle.clone(),
-            ));
-            read_task = Some(task);
-        }
-
-        let mut write_task = None;
-        let mut write_tx = None;
-        let queue_len = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        if let Some(send) = send_stream {
-            info!("Spawning write task immediately in new");
-            let (tx, rx) = tokio::sync::mpsc::channel(WRITE_CHANNEL_CAP);
-            let task = tokio::spawn(write_loop_bounded(
-                send,
-                rx,
-                self_handle.clone(),
-                queue_len.clone(),
-                "main",
-            ));
-            write_task = Some(task);
-            write_tx = Some(tx);
-        }
-
         Self {
             rx,
-            state: if conn.is_some() && write_task.is_some() && read_task.is_some() {
-                ConnState::Open
-            } else {
-                ConnState::Disconnected
-            },
+            state: Watchable::new(ConnState::Connecting),
             external_sender,
-            read_task,
-            write_task,
-            write_tx,
-            queue_len,
+            local_endpoint_id,
+            read_task: None,
+            write_task: None,
+            closed_task: None,
+            write_tx: None,
+            queue_len: Arc::new(AtomicUsize::new(0)),
             sender_queue: VecDeque::with_capacity(QUEUE_SIZE),
-            conn,
-            endpoint,
-            last_reconnect: tokio::time::Instant::now(),
-            reconnect_backoff: Duration::from_millis(500),
+            conn: None,
             conn_endpoint_id,
             self_handle,
-            reconnect_count: AtomicUsize::new(0),
-            last_rx: Instant::now(),
-            last_tx: Instant::now(),
-            rx_count: 0,
-            tx_count: 0,
-            write_timeouts: 0,
-            consecutive_write_errors: 0,
-            dropped_packets: 0,
-        }
-    }
-
-    pub fn set_state(&mut self, state: ConnState) {
-        if self.state != state {
-            info!(
-                "Connection state transition: {:?} -> {:?}",
-                self.state, state
-            );
-            self.state = state;
+            rx_count: Arc::new(AtomicUsize::new(0)),
+            tx_count: Arc::new(AtomicUsize::new(0)),
+            write_timeouts: Arc::new(AtomicUsize::new(0)),
+            consecutive_write_errors: Arc::new(AtomicUsize::new(0)),
+            dropped_packets: Arc::new(AtomicUsize::new(0)),
+            conn_generation: generation.unwrap_or_default(),
+            remote_generation: Watchable::new(None),
         }
     }
 
     pub async fn close(&mut self) {
         info!("Closing connection actor");
-        self.state = ConnState::Closed;
         if let Some(conn) = self.conn.as_mut() {
             conn.close(VarInt::from_u32(400), b"Connection closed by user");
         }
@@ -378,22 +400,56 @@ impl ConnActor {
         if let Some(task) = self.write_task.take() {
             task.abort();
         }
+        if let Some(task) = self.closed_task.take() {
+            task.abort();
+        }
         self.write_tx = None;
         self.conn = None;
+        self.state.set(ConnState::Closed).ok();
     }
 
-    pub async fn handle_write_error(&mut self) {
-        self.consecutive_write_errors = self.consecutive_write_errors.saturating_add(1);
+    pub async fn handle_connection_closed(&mut self, generation: usize) {
+        if generation != self.conn_generation {
+            trace!(
+                "Ignoring stale closed event for generation {}, current generation {}",
+                generation, self.conn_generation
+            );
+            return;
+        }
+
+        if self.state.get() == ConnState::Closed {
+            return;
+        }
+
         warn!(
-            "Write loop failed. consecutive_write_errors={}",
-            self.consecutive_write_errors
+            "Connection closed event received for {} (generation={})",
+            self.conn_endpoint_id, generation
         );
         self.write_tx = None;
         if let Some(task) = self.write_task.take() {
             task.abort();
         }
-        if self.consecutive_write_errors >= MAX_CONSECUTIVE_WRITE_ERRORS {
-            self.set_state(ConnState::Disconnected);
+        if let Some(task) = self.read_task.take() {
+            task.abort();
+        }
+        if !matches!(self.state.get(), ConnState::Disconnected | ConnState::ClosedAndStopped | ConnState::Closed) {
+            self.state.set(ConnState::Disconnected).ok();
+        }
+    }
+
+    pub async fn handle_write_error(&mut self) {
+        self.consecutive_write_errors
+            .fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "Write loop failed. consecutive_write_errors={}",
+            self.consecutive_write_errors.load(Ordering::Relaxed)
+        );
+        self.write_tx = None;
+        if let Some(task) = self.write_task.take() {
+            task.abort();
+        }
+        if !matches!(self.state.get(), ConnState::Disconnected | ConnState::ClosedAndStopped | ConnState::Closed) {
+            self.state.set(ConnState::Disconnected).ok();
         }
     }
 
@@ -402,20 +458,21 @@ impl ConnActor {
             trace!("Sending packet to write task");
             match tx.try_send(pkg) {
                 Ok(_) => {
-                    let new_len = self
-                        .queue_len
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
+                    let new_len = self.queue_len.fetch_add(1, Ordering::Relaxed) + 1;
                     if new_len > QUEUE_WARN_LEN {
                         warn!("Stream queue length high: {}", new_len);
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    self.dropped_packets = self.dropped_packets.saturating_add(1);
-                    if self.dropped_packets.is_multiple_of(1000) {
+                    self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    if self
+                        .dropped_packets
+                        .load(Ordering::Relaxed)
+                        .is_multiple_of(1000)
+                    {
                         warn!(
                             "Write queue full, dropping packet (dropped={})",
-                            self.dropped_packets
+                            self.dropped_packets.load(Ordering::Relaxed)
                         );
                     }
                 }
@@ -425,8 +482,8 @@ impl ConnActor {
                     while self.sender_queue.len() > MAX_SENDER_QUEUE {
                         self.sender_queue.pop_back();
                     }
-                    if self.state == ConnState::Open {
-                        self.set_state(ConnState::Disconnected);
+                    if self.state.get() == ConnState::Open {
+                        self.state.set(ConnState::Disconnected).ok();
                     }
                 }
             }
@@ -442,99 +499,149 @@ impl ConnActor {
         }
     }
 
-    fn note_rx(&mut self) {
-        self.last_rx = Instant::now();
-        self.rx_count = self.rx_count.saturating_add(1);
-    }
-
-    fn note_tx(&mut self) {
-        self.last_tx = Instant::now();
-        self.tx_count = self.tx_count.saturating_add(1);
-        self.consecutive_write_errors = 0;
-    }
-
-    fn inc_write_timeout(&mut self) {
-        self.write_timeouts = self.write_timeouts.saturating_add(1);
-    }
-
-    pub async fn incoming_connection(
+    pub async fn establish_connection(
         &mut self,
         conn: Connection,
-        send_stream: SendStream,
-        recv_stream: RecvStream,
+        mut send_stream: SendStream,
+        mut recv_stream: RecvStream,
     ) -> Result<()> {
         info!("Incoming connection from: {}", conn.remote_id());
         if conn.close_reason().is_some() {
             warn!("Incoming connection already closed");
-            self.state = ConnState::Disconnected;
+            self.state.set(ConnState::Disconnected).ok();
             return Err(anyhow::anyhow!("connection closed"));
         }
+
+        // Nagotiate generation, only accept if higher, if equal decide based on endpoint ID to avoid races
+        let remote_generation = match conn.side() {
+            iroh::endpoint::Side::Client => {
+                if send_stream
+                    .write_u64(self.conn_generation as u64)
+                    .await
+                    .is_err()
+                {
+                    self.state.set(ConnState::Closed).ok();
+                    return Err(anyhow::anyhow!("failed to write generation to stream"));
+                }
+                let remote_generation = if let Ok(generation) = recv_stream.read_u64().await {
+                    generation as usize
+                } else {
+                    self.state.set(ConnState::Closed).ok();
+                    return Err(anyhow::anyhow!("failed to read generation from stream"));
+                };
+                if remote_generation > self.conn_generation {
+                    self.state.set(ConnState::Closed).ok();
+                    warn!("[CONN] Rejecting connection with higher generation: remote_generation={}, local_generation={}", remote_generation, self.conn_generation);
+                    return Err(anyhow::anyhow!("remote has higher generation, rejecting connection"));
+                }
+                remote_generation
+            }
+            iroh::endpoint::Side::Server => {
+                let remote_generation = if let Ok(generation) = recv_stream.read_u64().await {
+                    generation as usize
+                } else {
+                    self.state.set(ConnState::Closed).ok();
+                    return Err(anyhow::anyhow!("failed to read generation from stream"));
+                };
+
+                if send_stream
+                    .write_u64(self.conn_generation as u64)
+                    .await
+                    .is_err()
+                {
+                    self.state.set(ConnState::Closed).ok();
+                    return Err(anyhow::anyhow!("failed to write generation to stream"));
+                }
+                if self.conn_generation > remote_generation {
+                    self.state.set(ConnState::Closed).ok();
+                    warn!("[CONN] Rejecting connection with lower generation: remote_generation={}, local_generation={}", remote_generation, self.conn_generation);
+                    return Err(anyhow::anyhow!("remote has lower generation, rejecting connection"));
+                }
+                remote_generation
+            }
+        };
+
+        self.remote_generation.set(Some(remote_generation)).ok();
+        self.conn_generation = remote_generation.max(self.conn_generation);
 
         if let Some(task) = self.read_task.take() {
             task.abort();
         }
 
         info!("Spawning read task for incoming connection");
+        let rx_count = self.rx_count.clone();
         self.read_task = Some(tokio::spawn(retry_read_loop(
             recv_stream,
             self.external_sender.clone(),
             self.self_handle.clone(),
+            rx_count,
         )));
 
         if let Some(task) = self.write_task.take() {
             task.abort();
         }
+        if let Some(task) = self.closed_task.take() {
+            task.abort();
+        }
 
         info!("Spawning write task for incoming connection");
         let (tx, rx) = tokio::sync::mpsc::channel(WRITE_CHANNEL_CAP);
-        self.queue_len
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.queue_len.store(0, Ordering::Relaxed);
+        let write_timeouts = self.write_timeouts.clone();
+        let tx_count = self.tx_count.clone();
         self.write_task = Some(tokio::spawn(write_loop_bounded(
             send_stream,
             rx,
             self.self_handle.clone(),
             self.queue_len.clone(),
             "main",
+            tx_count,
+            write_timeouts,
         )));
         self.write_tx = Some(tx.clone());
 
+        self.closed_task = Some(Self::spawn_closed_task(
+            self.self_handle.clone(),
+            conn.clone(),
+            self.conn_generation,
+        ));
         self.conn = Some(conn);
-        self.set_state(ConnState::Open);
-        self.reconnect_backoff = RECONNECT_BACKOFF_BASE;
-        self.consecutive_write_errors = 0;
-        self.rx_count = 0;
-        self.tx_count = 0;
-        self.last_rx = Instant::now();
-        self.last_tx = Instant::now();
+        self.consecutive_write_errors.store(0, Ordering::Relaxed);
+        self.rx_count.store(0, Ordering::Relaxed);
+        self.tx_count.store(0, Ordering::Relaxed);
 
         while let Some(msg) = self.sender_queue.pop_back() {
             match tx.try_send(msg) {
                 Ok(_) => {
-                    let new_len = self
-                        .queue_len
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        + 1;
+                    let new_len = self.queue_len.fetch_add(1, Ordering::Relaxed) + 1;
                     if new_len > QUEUE_WARN_LEN {
                         warn!("Stream queue length high (flush): {}", new_len);
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    self.dropped_packets = self.dropped_packets.saturating_add(1);
+                    self.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    self.dropped_packets = self.dropped_packets.saturating_add(1);
+                    self.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
 
+        self.state.set(ConnState::Open).ok();
+
         Ok(())
     }
 
+    /*
     async fn try_reconnect(&mut self) -> Result<()> {
         info!("Trying to reconnect to {}", self.conn_endpoint_id);
         if self.state == ConnState::Closed {
             warn!("Cannot reconnect, actor is closed");
             return Err(anyhow::anyhow!("actor closed for good"));
+        }
+        if self.endpoint.id() < self.conn_endpoint_id && !matches!(self.state, ConnState::Connecting) {
+            debug!("Skipping reconnect attempt due to endpoint ID ordering");
+            return Ok(());
         }
         self.state = ConnState::Connecting;
 
@@ -542,6 +649,9 @@ impl ConnActor {
             task.abort();
         }
         if let Some(task) = self.write_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.closed_task.take() {
             task.abort();
         }
         self.write_tx = None;
@@ -575,13 +685,13 @@ impl ConnActor {
                             .call(act!(actor => actor.incoming_connection(conn, send, recv)))
                             .await;
                         let _ = api
-                            .call(act_ok!(actor => async move { actor.reconnect_count.store(0, std::sync::atomic::Ordering::SeqCst) }))
+                            .call(act_ok!(actor => async move { actor.reconnect_count.store(0, Ordering::SeqCst) }))
                             .await;
                     }
                     Ok(Err(e)) => {
                         warn!("Reconnection to {} failed: {}", conn_node_id, e);
                         let _ = api
-                            .call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) }))
+                            .call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, Ordering::SeqCst) }))
                             .await;
                         let _ = api
                             .call(
@@ -592,7 +702,7 @@ impl ConnActor {
                     Err(_) => {
                         warn!("Reconnection to {} timed out after {}s", conn_node_id, CONNECTING_TIMEOUT.as_secs());
                         let _ = api
-                            .call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) }))
+                            .call(act_ok!(actor => async move { actor.reconnect_count.fetch_add(1, Ordering::SeqCst) }))
                             .await;
                         let _ = api
                             .call(
@@ -604,23 +714,23 @@ impl ConnActor {
             }
         });
         Ok(())
-    }
+    }*/
 }
 
 async fn write_loop_bounded(
     mut stream: SendStream,
     mut rx: tokio::sync::mpsc::Receiver<DirectMessage>,
     api: Handle<ConnActor, anyhow::Error>,
-    queue_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    queue_len: Arc<std::sync::atomic::AtomicUsize>,
     label: &'static str,
+    tx_count: Arc<AtomicUsize>,
+    write_timeout: Arc<AtomicUsize>,
 ) {
     info!("Write task started ({})", label);
     while let Some(msg) = rx.recv().await {
-        let _ = queue_len.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = queue_len.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
         let bytes = match postcard::to_stdvec(&msg) {
             Ok(b) => b,
             Err(e) => {
@@ -630,11 +740,11 @@ async fn write_loop_bounded(
         };
 
         // Coalesce length and body into a single write to avoid small packets and syscall overhead
-        let mut frame = Vec::with_capacity(4 + bytes.len());
-        frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        let mut frame = Vec::with_capacity(2 + bytes.len());
+        frame.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
         frame.extend_from_slice(&bytes);
 
-        match time::timeout(WRITE_TIMEOUT, stream.write_all(&frame)).await {
+        match time::timeout(KEEPALIVE_INTERVAL + Duration::from_secs(2), stream.write_all(&frame)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 warn!("Write error (frame): {}", e);
@@ -643,17 +753,13 @@ async fn write_loop_bounded(
             }
             Err(_) => {
                 warn!("Write timeout (frame) ({})", label);
-                let _ = api
-                    .call(act_ok!(actor => async move { actor.inc_write_timeout(); }))
-                    .await;
+                write_timeout.fetch_add(1, Ordering::SeqCst);
                 let _ = api.call(act_ok!(actor => actor.handle_write_error())).await;
                 break;
             }
         }
 
-        /*let _ = api
-            .call(act_ok!(actor => async move { actor.note_tx(); }))
-            .await;*/
+        tx_count.fetch_add(1, Ordering::SeqCst);
     }
     info!("Write task stopped ({})", label);
 }
@@ -662,14 +768,13 @@ async fn retry_read_loop(
     mut stream: RecvStream,
     sender: tokio::sync::mpsc::Sender<DirectMessage>,
     api: Handle<ConnActor, anyhow::Error>,
+    rx_count: Arc<AtomicUsize>,
 ) {
     info!("Read task started");
     loop {
-        match read_next_msg(&mut stream).await {
-            Ok(msg) => {
-                /*let _ = api
-                    .call(act_ok!(actor => async move { actor.note_rx(); }))
-                    .await;*/
+        match tokio::time::timeout(KEEPALIVE_INTERVAL + Duration::from_secs(2), read_next_msg(&mut stream)).await {
+            Ok(Ok(msg)) => {
+                rx_count.fetch_add(1, Ordering::SeqCst);
                 trace!("Read message from stream, forwarding to network actor");
                 let start = std::time::Instant::now();
                 if let Err(e) = sender.send(msg).await {
@@ -683,10 +788,26 @@ async fn retry_read_loop(
                     );
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Stream read error: {}", e);
                 let _ = api
-                    .call(act_ok!(actor => async move { actor.set_state(ConnState::Disconnected) }))
+                    .call(act_ok!(actor => async move { 
+                        if !matches!(actor.state.get(), ConnState::Disconnected | ConnState::ClosedAndStopped | ConnState::Closed) {
+                            actor.state.set(ConnState::Disconnected).ok();
+                        }
+                    }))
+                    .await;
+                break;
+            }
+            Err(e) => {
+                warn!("Stream read error: timeout after {}", e);
+        
+                let _ = api
+                    .call(act_ok!(actor => async move { 
+                        if !matches!(actor.state.get(), ConnState::Disconnected | ConnState::ClosedAndStopped | ConnState::Closed) {
+                            actor.state.set(ConnState::Disconnected).ok();
+                        }
+                    }))
                     .await;
                 break;
             }
@@ -696,7 +817,7 @@ async fn retry_read_loop(
 }
 
 async fn read_next_msg(stream: &mut RecvStream) -> Result<DirectMessage> {
-    let len = stream.read_u32_le().await?;
+    let len = stream.read_u16_le().await?;
     let mut buf = vec![0; len as usize];
     stream.read_exact(&mut buf).await?;
     let msg: DirectMessage = postcard::from_bytes(&buf)?;

@@ -294,9 +294,9 @@ impl Actor<anyhow::Error> for RouterActor {
 
 impl RouterActor {
     async fn populate_from_kv(&mut self) {
-        let all_keys = self.kv.query_all().await;
-        for key in all_keys {
-            self.apply_key(&key);
+        let all_entries = self.kv.query_all_entries().await;
+        for (key, timestamp) in all_entries {
+            self.apply_key(&key, timestamp);
         }
         debug!(
             "Populated from Kv: {} startup, {} assignments, {} candidate IPs",
@@ -307,10 +307,10 @@ impl RouterActor {
     }
 
     fn handle_kv_event(&mut self, event: &KvEvent) {
-        self.apply_key(&event.key);
+        self.apply_key(&event.key, event.timestamp);
     }
 
-    fn apply_key(&mut self, key: &str) {
+    fn apply_key(&mut self, key: &str, timestamp: u64) {
         let startup_prefix = key_startup_prefix();
         let assigned_prefix = key_assigned_ip();
         let candidate_prefix = key_candidate_ip_prefix();
@@ -326,11 +326,11 @@ impl RouterActor {
                 );
             }
         } else if key.starts_with(&assigned_prefix) {
-            if let Ok(ip_assignment) = decode_ip_assignment(key) {
+            if let Ok(ip_assignment) = decode_ip_assignment(key, timestamp) {
                 self.assignments.insert(ip_assignment.ip, ip_assignment);
             }
         } else if key.starts_with(&candidate_prefix)
-            && let Ok(ip_candidate) = decode_ip_candidate(key)
+            && let Ok(ip_candidate) = decode_ip_candidate(key, timestamp)
         {
             self.candidates
                 .entry(ip_candidate.ip)
@@ -374,20 +374,16 @@ fn is_stale(last_updated: u64, stale_secs: u64) -> bool {
     current_time().saturating_sub(last_updated) > stale_secs
 }
 
-fn decode_ip_assignment(key: &str) -> Result<IpAssignment> {
+fn decode_ip_assignment(key: &str, timestamp: u64) -> Result<IpAssignment> {
     let parts: Vec<&str> = key.split('/').collect();
-    if parts.len() != 6 {
+    if parts.len() != 5 {
         warn!(
             "Invalid key format for IpAssignment (invalid length): {}",
             key
         );
         anyhow::bail!("Invalid key format for IpAssignment");
     }
-    if let (Ok(ip), Ok(endpoint_id), Ok(timestamp)) = (
-        parts[3].parse::<Ipv4Addr>(),
-        parts[4].parse::<EndpointId>(),
-        parts[5].parse::<u64>(),
-    ) {
+    if let (Ok(ip), Ok(endpoint_id)) = (parts[3].parse::<Ipv4Addr>(), parts[4].parse::<EndpointId>()) {
         Ok(IpAssignment {
             ip,
             endpoint_id,
@@ -403,30 +399,23 @@ fn decode_ip_assignment(key: &str) -> Result<IpAssignment> {
 }
 
 fn encode_ip_assignment(assignment: &IpAssignment) -> String {
-    format!(
-        "/assigned/ip/{}/{}/{}",
-        assignment.ip, assignment.endpoint_id, assignment.last_updated
-    )
+    format!("/assigned/ip/{}/{}", assignment.ip, assignment.endpoint_id)
 }
 
 fn key_assigned_ip() -> String {
     "/assigned/ip/".to_string()
 }
 
-fn decode_ip_candidate(key: &str) -> Result<IpCandidate> {
+fn decode_ip_candidate(key: &str, timestamp: u64) -> Result<IpCandidate> {
     let parts: Vec<&str> = key.split('/').collect();
-    if parts.len() != 6 {
+    if parts.len() != 5 {
         warn!(
             "Invalid key format for IpCandidate (invalid length): {}",
             key
         );
         anyhow::bail!("Invalid key format for IpCandidate");
     }
-    if let (Ok(ip), Ok(endpoint_id), Ok(timestamp)) = (
-        parts[3].parse::<Ipv4Addr>(),
-        parts[4].parse::<EndpointId>(),
-        parts[5].parse::<u64>(),
-    ) {
+    if let (Ok(ip), Ok(endpoint_id)) = (parts[3].parse::<Ipv4Addr>(), parts[4].parse::<EndpointId>()) {
         Ok(IpCandidate {
             ip,
             endpoint_id,
@@ -442,10 +431,7 @@ fn decode_ip_candidate(key: &str) -> Result<IpCandidate> {
 }
 
 fn encode_ip_candidate(candidate: &IpCandidate) -> String {
-    format!(
-        "/candidates/ip/{}/{}/{}",
-        candidate.ip, candidate.endpoint_id, candidate.last_updated
-    )
+    format!("/candidates/ip/{}/{}", candidate.ip, candidate.endpoint_id)
 }
 
 fn decode_endpoint_id_from_startup(key: &str) -> Result<EndpointId> {
@@ -760,7 +746,7 @@ impl RouterActor {
                             Ok(false)
                         } else {
                             // Refresh if needed (every 30s)
-                            if current_time() - ip_assignment.last_updated > 30 {
+                            if current_time().saturating_sub(ip_assignment.last_updated) > 30 {
                                 info!("Refreshing IP assignment for {}", my_ip);
                                 if let Err(e) =
                                     self.write_ip_assignment(my_ip, self.endpoint_id).await

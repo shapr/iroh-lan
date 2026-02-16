@@ -5,7 +5,10 @@ use std::{
 
 use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
-use iroh::{Endpoint, EndpointId, SecretKey, endpoint::{IdleTimeout, QuicTransportConfig, VarInt}};
+use iroh::{
+    Endpoint, EndpointId, SecretKey,
+    endpoint::{IdleTimeout, QuicTransportConfig, VarInt},
+};
 use iroh_auth::Authenticator;
 
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
@@ -13,7 +16,10 @@ use iroh_topic_tracker::TopicDiscoveryHook;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::{Direct, DirectMessage, Router, Tun, local_networking::Ipv4Pkg, router::RouterIp};
+use crate::{
+    Direct, DirectMessage, Router, Tun, direct_connect::PeerState, local_networking::Ipv4Pkg,
+    router::RouterIp,
+};
 
 const PENDING_TTL: Duration = Duration::from_secs(60);
 const PENDING_MAX_PER_IP: usize = 1024 * 16;
@@ -33,7 +39,7 @@ struct NetworkActor {
 
     _iroh_router: iroh::protocol::Router,
     //_docs_router: iroh::protocol::Router,
-    _iroh_endpoint: iroh::endpoint::Endpoint,
+    iroh_endpoint: iroh::endpoint::Endpoint,
 
     tun: Option<Tun>,
 
@@ -110,6 +116,7 @@ impl Network {
         };
 
         let gossip = Gossip::builder()
+            .max_message_size(64 * 1024)
             .membership_config(gossip_hyparview_config)
             .broadcast_config(gossip_plumtree_config)
             .spawn(endpoint.clone());
@@ -145,7 +152,7 @@ impl Network {
 
                 _iroh_router,
                 //_docs_router,
-                _iroh_endpoint: endpoint,
+                iroh_endpoint: endpoint,
 
                 tun: None,
                 tun_ip_debug: None,
@@ -292,7 +299,7 @@ impl Actor<anyhow::Error> for NetworkActor {
                         for ip in cached_ips {
                             if let std::collections::hash_map::Entry::Vacant(e) = router_peers.entry(ip)
                                 && let Some(owner_id) = self.ip_cache.get(&ip)
-                                    && let Ok(crate::connection::ConnState::Open) = self.direct.get_conn_state(*owner_id).await {
+                                    && matches!(self.direct.get_peer_state(*owner_id).await, Ok(PeerState::Connected) | Ok(PeerState::Connecting)) {
                                         debug!("[Data-Plane Liveness] Preserving route to {} (owned by {}) despite Router/Doc miss. Connection is OPEN.", ip, owner_id);
                                         e.insert(*owner_id);
                                         next_peer_ids.insert(*owner_id);
@@ -354,26 +361,24 @@ impl Actor<anyhow::Error> for NetworkActor {
                                 };
                                 match to {
                                     Ok(to) => {
-                                        if to == self._iroh_endpoint.id() {
+                                        if to == self.iroh_endpoint.id() {
                                             trace!("Loopback packet detected (dest to self)");
                                             if let Some(tun) = &self.tun
-                                                && let Err(e) = tun.write(tun_recv).await {
+                                                && let Err(e) = tun.write(tun_recv.clone()).await {
                                                     warn!("Failed to loopback packet to TUN: {}", e);
+                                                    self.queue_packet(dest, tun_recv);
                                                 }
                                         } else {
                                             trace!("Routing packet from TUN to {}", to);
-                                            if let Err(e) = self.direct.route_packet(to, DirectMessage::IpPacket(tun_recv)).await {
-                                                warn!("Failed to route packet to {}: {}", to, e);
+                                            if let Err(e) = self.direct.route_packet(to, DirectMessage::IpPacket(tun_recv.clone())).await {
+                                                self.queue_packet(dest, tun_recv);
+                                                trace!("Failed to route packet to {}: {}", to, e);
                                             }
                                         }
                                     }
                                     Err(e) => {
                                         trace!("Could not resolve endpoint for IP {}: {}", dest, e);
-                                        let queue = self.pending_packets.entry(dest).or_default();
-                                        if queue.len() >= PENDING_MAX_PER_IP {
-                                            queue.pop_front();
-                                        }
-                                        queue.push_back((Instant::now(), tun_recv));
+                                        self.queue_packet(dest, tun_recv);
                                     }
                                 }
                             }
@@ -407,5 +412,15 @@ impl Actor<anyhow::Error> for NetworkActor {
         }
 
         Ok(())
+    }
+}
+
+impl NetworkActor {
+    fn queue_packet(&mut self, ip: std::net::Ipv4Addr, pkt: Ipv4Pkg) {
+        let queue = self.pending_packets.entry(ip).or_default();
+        if queue.len() >= PENDING_MAX_PER_IP {
+            queue.pop_front();
+        }
+        queue.push_back((Instant::now(), pkt.clone()));
     }
 }

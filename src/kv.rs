@@ -96,6 +96,16 @@ impl Kv {
 }
 
 impl Kv {
+    pub async fn query_all_entries(&self) -> Vec<(String, u64)> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect()
+    }
+
     /// Insert (or update) a key.  Returns the timestamp that was written.
     ///
     /// The key is immediately broadcast to all gossip peers.
@@ -126,7 +136,11 @@ impl Kv {
 
     /// All keys, sorted lexicographically.
     pub async fn query_all(&self) -> Vec<String> {
-        self.inner.store.lock().await.keys().cloned().collect()
+        self.query_all_entries()
+            .await
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
     }
 
     /// All keys that start with `prefix`, sorted lexicographically.
@@ -174,6 +188,22 @@ impl Kv {
 }
 
 impl Kv {
+    fn canonical_state_key(key: &str) -> String {
+        if let Some(rest) = key.strip_prefix("/assigned/ip/") {
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() >= 2 {
+                return format!("/assigned/ip/{}/{}", parts[0], parts[1]);
+            }
+        }
+        if let Some(rest) = key.strip_prefix("/candidates/ip/") {
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() >= 2 {
+                return format!("/candidates/ip/{}/{}", parts[0], parts[1]);
+            }
+        }
+        key.to_string()
+    }
+
     /// Apply a remote key.  Returns `true` if the store was actually updated
     /// (i.e. the incoming timestamp was strictly newer).
     async fn apply(&self, key: &str, timestamp: u64) -> bool {
@@ -189,13 +219,18 @@ impl Kv {
 
     /// Snapshot the entire store for a `State` broadcast.
     async fn snapshot(&self) -> Vec<(String, u64)> {
-        self.inner
-            .store
-            .lock()
-            .await
-            .iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect()
+        let store = self.inner.store.lock().await;
+        let mut latest = BTreeMap::<String, u64>::new();
+        for (key, &timestamp) in store.iter() {
+            let canonical = Self::canonical_state_key(key);
+            match latest.get(&canonical) {
+                Some(&existing) if existing >= timestamp => {}
+                _ => {
+                    latest.insert(canonical, timestamp);
+                }
+            }
+        }
+        latest.into_iter().collect()
     }
 
     /// Broadcast a full state dump.
