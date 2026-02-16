@@ -25,3 +25,9 @@ target
 
 /target
 .DS_Store
+
+# emacs
+.#
+# nix
+.direnv/*
+.envrc
