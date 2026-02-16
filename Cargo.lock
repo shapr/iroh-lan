@@ -2012,6 +2012,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.96.0"
+source = "git+https://github.com/n0-computer/iroh-gossip?rev=c1ad5da464e0238425b29be748478d027ea0b878#c1ad5da464e0238425b29be748478d027ea0b878"
 dependencies = [
  "blake3",
  "bytes",
@@ -2100,6 +2101,7 @@ dependencies = [
 [[package]]
 name = "iroh-quinn"
 version = "0.16.1"
+source = "git+https://github.com/n0-computer/quinn?rev=315f491bfbdd0bb04fb8cdb43967b40bfef83d22#315f491bfbdd0bb04fb8cdb43967b40bfef83d22"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2108,7 +2110,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2119,6 +2121,7 @@ dependencies = [
 [[package]]
 name = "iroh-quinn-proto"
 version = "0.15.1"
+source = "git+https://github.com/n0-computer/quinn?rev=315f491bfbdd0bb04fb8cdb43967b40bfef83d22#315f491bfbdd0bb04fb8cdb43967b40bfef83d22"
 dependencies = [
  "bytes",
  "derive_more",
@@ -2143,10 +2146,11 @@ dependencies = [
 [[package]]
 name = "iroh-quinn-udp"
 version = "0.8.0"
+source = "git+https://github.com/n0-computer/quinn?rev=315f491bfbdd0bb04fb8cdb43967b40bfef83d22#315f491bfbdd0bb04fb8cdb43967b40bfef83d22"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]

@@ -17,8 +17,7 @@ use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    Direct, DirectMessage, Router, Tun, direct_connect::PeerState, local_networking::Ipv4Pkg,
-    router::RouterIp,
+    ConnState, Direct, DirectMessage, Router, Tun, local_networking::Ipv4Pkg, router::RouterIp
 };
 
 const PENDING_TTL: Duration = Duration::from_secs(60);
@@ -299,7 +298,7 @@ impl Actor<anyhow::Error> for NetworkActor {
                         for ip in cached_ips {
                             if let std::collections::hash_map::Entry::Vacant(e) = router_peers.entry(ip)
                                 && let Some(owner_id) = self.ip_cache.get(&ip)
-                                    && matches!(self.direct.get_peer_state(*owner_id).await, Ok(PeerState::Connected) | Ok(PeerState::Connecting)) {
+                                    && matches!(self.direct.get_peer_state(*owner_id).await, Ok(ConnState::Open) | Ok(ConnState::Connecting)) {
                                         debug!("[Data-Plane Liveness] Preserving route to {} (owned by {}) despite Router/Doc miss. Connection is OPEN.", ip, owner_id);
                                         e.insert(*owner_id);
                                         next_peer_ids.insert(*owner_id);

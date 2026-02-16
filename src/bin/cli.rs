@@ -1,8 +1,4 @@
 use anyhow::Result;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
-const WORKERS: usize = 32;
 
 #[tokio::main]
 async fn main() -> Result<()> {

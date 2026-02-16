@@ -43,7 +43,6 @@ struct ConnActor {
     rx: Receiver<Action<ConnActor>>,
     self_handle: Handle<ConnActor, anyhow::Error>,
     state: Watchable<ConnState>,
-    local_endpoint_id: EndpointId,
 
     // all of these need to be optionals so that we can create an empty
     // shell of the actor and then fill in the values later so we don't wait
@@ -68,8 +67,6 @@ struct ConnActor {
     tx_count: Arc<AtomicUsize>,
     write_timeouts: Arc<AtomicUsize>,
     consecutive_write_errors: Arc<AtomicUsize>,
-    conn_generation: usize,
-    remote_generation: Watchable<Option<usize>>,
 }
 
 impl Conn {
@@ -77,18 +74,13 @@ impl Conn {
     pub async fn accept_connection(
         conn: iroh::endpoint::Connection,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
-        generation: Option<usize>,
-        local_endpoint_id: EndpointId,
     ) -> Result<Self> {
-        info!("[CONN] Accepting incoming gen: {generation:?}");
         let (api, rx) = Handle::channel();
         let mut actor = ConnActor::new(
             rx,
             api.clone(),
             external_sender,
             conn.remote_id(),
-            local_endpoint_id,
-            generation,
         )
         .await;
 
@@ -135,15 +127,12 @@ impl Conn {
     pub async fn open_connection(
         endpoint: Endpoint,
         remote_endpoint_id: EndpointId,
-        local_endpoint_id: EndpointId,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
-        generation: Option<usize>,
 
     ) -> Result<Self> {
-        info!("[CONN] Opening incoming gen: {generation:?}");
         let (api, rx) = Handle::channel();
         let mut actor =
-            ConnActor::new(rx, api.clone(), external_sender, remote_endpoint_id, local_endpoint_id, generation).await;
+            ConnActor::new(rx, api.clone(), external_sender, remote_endpoint_id).await;
 
         tokio::spawn(async move {
             actor.state.set(ConnState::Connecting).ok();
@@ -221,24 +210,6 @@ impl Conn {
         self.api
             .call(act!(actor => actor.establish_connection(conn, send_stream, recv_stream)))
             .await
-    }
-
-    pub async fn get_generation(&self) -> usize {
-        self.api
-            .call(act_ok!(actor => async {
-                actor.conn_generation
-            }))
-            .await
-            .unwrap_or_default()
-    }
-
-    pub async fn get_remote_generation(&self) -> Option<usize> {
-        self.api
-            .call(act_ok!(actor => async {
-                actor.remote_generation.get()
-            }))
-            .await
-            .unwrap_or_default()
     }
 
     pub async fn drop(&self) {
@@ -344,13 +315,12 @@ impl ConnActor {
     fn spawn_closed_task(
         api: Handle<ConnActor, anyhow::Error>,
         conn: Connection,
-        generation: usize,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let _reason = conn.closed().await;
             let _ = api
                 .call(act_ok!(actor => async move {
-                    actor.handle_connection_closed(generation).await;
+                    actor.handle_connection_closed().await;
                 }))
                 .await;
         })
@@ -362,14 +332,11 @@ impl ConnActor {
         self_handle: Handle<ConnActor, anyhow::Error>,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
         conn_endpoint_id: EndpointId,
-        local_endpoint_id: EndpointId,
-        generation: Option<usize>,
     ) -> Self {
         Self {
             rx,
             state: Watchable::new(ConnState::Connecting),
             external_sender,
-            local_endpoint_id,
             read_task: None,
             write_task: None,
             closed_task: None,
@@ -384,8 +351,6 @@ impl ConnActor {
             write_timeouts: Arc::new(AtomicUsize::new(0)),
             consecutive_write_errors: Arc::new(AtomicUsize::new(0)),
             dropped_packets: Arc::new(AtomicUsize::new(0)),
-            conn_generation: generation.unwrap_or_default(),
-            remote_generation: Watchable::new(None),
         }
     }
 
@@ -408,22 +373,15 @@ impl ConnActor {
         self.state.set(ConnState::Closed).ok();
     }
 
-    pub async fn handle_connection_closed(&mut self, generation: usize) {
-        if generation != self.conn_generation {
-            trace!(
-                "Ignoring stale closed event for generation {}, current generation {}",
-                generation, self.conn_generation
-            );
-            return;
-        }
-
+    pub async fn handle_connection_closed(&mut self) {
+       
         if self.state.get() == ConnState::Closed {
             return;
         }
 
         warn!(
-            "Connection closed event received for {} (generation={})",
-            self.conn_endpoint_id, generation
+            "Connection closed event received for {}",
+            self.conn_endpoint_id
         );
         self.write_tx = None;
         if let Some(task) = self.write_task.take() {
@@ -512,60 +470,34 @@ impl ConnActor {
             return Err(anyhow::anyhow!("connection closed"));
         }
 
-        // Nagotiate generation, only accept if higher, if equal decide based on endpoint ID to avoid races
-        let remote_generation = match conn.side() {
+        match conn.side() {
             iroh::endpoint::Side::Client => {
-                if send_stream
-                    .write_u64(self.conn_generation as u64)
+                if let Err(err) = send_stream
+                    .write_u8(1)
                     .await
-                    .is_err()
                 {
                     self.state.set(ConnState::Closed).ok();
-                    return Err(anyhow::anyhow!("failed to write generation to stream"));
+                    return Err(anyhow::anyhow!("failed to write from new connection: {}", err));
                 }
-                let remote_generation = if let Ok(generation) = recv_stream.read_u64().await {
-                    generation as usize
-                } else {
+                if let Err(err) = recv_stream.read_u8().await {
                     self.state.set(ConnState::Closed).ok();
-                    return Err(anyhow::anyhow!("failed to read generation from stream"));
-                };
-                if remote_generation > self.conn_generation {
-                    self.state.set(ConnState::Closed).ok();
-                    warn!("[CONN] Rejecting connection with higher generation: remote_generation={}, local_generation={}", remote_generation, self.conn_generation);
-                    return Err(anyhow::anyhow!("remote has higher generation, rejecting connection"));
+                    return Err(anyhow::anyhow!("failed to read from new connection: {}", err));
                 }
-                remote_generation
             }
             iroh::endpoint::Side::Server => {
-                let remote_generation = if let Ok(generation) = recv_stream.read_u64().await {
-                    generation as usize
-                } else {
+                if let Err(err) = recv_stream.read_u8().await {
                     self.state.set(ConnState::Closed).ok();
-                    return Err(anyhow::anyhow!("failed to read generation from stream"));
+                    return Err(anyhow::anyhow!("failed to read from new connection: {}", err));
                 };
 
-                if send_stream
-                    .write_u64(self.conn_generation as u64)
+                if let Err(err) = send_stream
+                    .write_u8(1)
                     .await
-                    .is_err()
                 {
                     self.state.set(ConnState::Closed).ok();
-                    return Err(anyhow::anyhow!("failed to write generation to stream"));
+                    return Err(anyhow::anyhow!("failed to write to new connection: {}", err));
                 }
-                if self.conn_generation > remote_generation {
-                    self.state.set(ConnState::Closed).ok();
-                    warn!("[CONN] Rejecting connection with lower generation: remote_generation={}, local_generation={}", remote_generation, self.conn_generation);
-                    return Err(anyhow::anyhow!("remote has lower generation, rejecting connection"));
-                }
-                remote_generation
             }
-        };
-
-        self.remote_generation.set(Some(remote_generation)).ok();
-        self.conn_generation = remote_generation.max(self.conn_generation);
-
-        if let Some(task) = self.read_task.take() {
-            task.abort();
         }
 
         info!("Spawning read task for incoming connection");
@@ -576,13 +508,6 @@ impl ConnActor {
             self.self_handle.clone(),
             rx_count,
         )));
-
-        if let Some(task) = self.write_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.closed_task.take() {
-            task.abort();
-        }
 
         info!("Spawning write task for incoming connection");
         let (tx, rx) = tokio::sync::mpsc::channel(WRITE_CHANNEL_CAP);
@@ -603,7 +528,6 @@ impl ConnActor {
         self.closed_task = Some(Self::spawn_closed_task(
             self.self_handle.clone(),
             conn.clone(),
-            self.conn_generation,
         ));
         self.conn = Some(conn);
         self.consecutive_write_errors.store(0, Ordering::Relaxed);
