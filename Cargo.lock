@@ -2101,7 +2101,7 @@ dependencies = [
 [[package]]
 name = "iroh-quinn"
 version = "0.16.1"
-source = "git+https://github.com/rustonbsd/quinn?rev=b7fe4ccd08d7d3919923d95d40ebeb07216babea#b7fe4ccd08d7d3919923d95d40ebeb07216babea"
+source = "git+https://github.com/rustonbsd/quinn?rev=b9fffdf0eaa4fa06875dc85473a0b6693ab5317d#b9fffdf0eaa4fa06875dc85473a0b6693ab5317d"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2121,7 +2121,7 @@ dependencies = [
 [[package]]
 name = "iroh-quinn-proto"
 version = "0.15.1"
-source = "git+https://github.com/rustonbsd/quinn?rev=b7fe4ccd08d7d3919923d95d40ebeb07216babea#b7fe4ccd08d7d3919923d95d40ebeb07216babea"
+source = "git+https://github.com/rustonbsd/quinn?rev=b9fffdf0eaa4fa06875dc85473a0b6693ab5317d#b9fffdf0eaa4fa06875dc85473a0b6693ab5317d"
 dependencies = [
  "bytes",
  "derive_more",
@@ -2146,7 +2146,7 @@ dependencies = [
 [[package]]
 name = "iroh-quinn-udp"
 version = "0.8.0"
-source = "git+https://github.com/rustonbsd/quinn?rev=b7fe4ccd08d7d3919923d95d40ebeb07216babea#b7fe4ccd08d7d3919923d95d40ebeb07216babea"
+source = "git+https://github.com/rustonbsd/quinn?rev=b9fffdf0eaa4fa06875dc85473a0b6693ab5317d#b9fffdf0eaa4fa06875dc85473a0b6693ab5317d"
 dependencies = [
  "cfg_aliases",
  "libc",
