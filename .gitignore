@@ -27,3 +27,9 @@ target
 .DS_Store
 
 docker_test/results_*
+
+# emacs
+.#
+# nix
+.direnv/*
+.envrc

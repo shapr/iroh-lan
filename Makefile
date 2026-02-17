@@ -1,4 +1,4 @@
-SHELL := /bin/bash
+SHELL := env bash
 
 .PHONY: build stress-test clean-test reliability-test clean-reliability
 
