@@ -13,12 +13,13 @@ long-stress-test: build
 	TOPIC="test_topic_$$RANDOM"; \
 	GAME_TEST_DURATION=530; \
 	echo "Using TOPIC=$$TOPIC"; \
-	sudo -E TOPIC=$$TOPIC docker compose -f docker_test/compose-stress.yaml up --build --abort-on-container-exit --remove-orphans
+	# sudo -E TOPIC=$$TOPIC docker compose -f docker_test/compose-stress.yaml up --build --abort-on-container-exit --remove-orphans
+	TOPIC=$$TOPIC docker compose -f docker_test/compose-stress.yaml up --build --abort-on-container-exit --remove-orphans
 
 stress-test: build
 	TOPIC="test_topic_$$RANDOM"; \
 	echo "Using TOPIC=$$TOPIC"; \
-	sudo -E WIFI_SIM_DELAY=100 TOPIC=$$TOPIC docker compose -f docker_test/compose-stress.yaml up --build --abort-on-container-exit --remove-orphans; \
+	WIFI_SIM_DELAY=100 TOPIC=$$TOPIC docker compose -f docker_test/compose-stress.yaml up --build --abort-on-container-exit --remove-orphans; \
 	echo ""; \
 	./docker_test/check_logs.sh
 

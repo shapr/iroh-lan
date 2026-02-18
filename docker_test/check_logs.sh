@@ -1,8 +1,8 @@
-#!/bin/bash
+#!env bash
 # docker_test/check_logs.sh
 
 # Find the latest server log directory (handling root ownership if needed)
-LOG_DIR=$(sudo ls -td docker_test/results_stress/server/*/ 2>/dev/null | head -1)
+LOG_DIR=$(ls -td docker_test/results_stress/server/*/ 2>/dev/null | head -1)
 
 if [ -z "$LOG_DIR" ]; then
     echo "No log directory found in docker_test/results_stress/server/"
@@ -12,7 +12,7 @@ fi
 LOG_FILE="$LOG_DIR/iroh.log"
 echo "Analyzing logs in: $LOG_DIR"
 
-if sudo [ ! -f "$LOG_FILE" ]; then
+if [ ! -f "$LOG_FILE" ]; then
     echo "Log file not found: $LOG_FILE"
     exit 0
 fi
@@ -21,9 +21,9 @@ echo "========================================================"
 echo "    DATA/CONTROL PLANE MISMATCH ANALYSIS"
 echo "========================================================"
 
-BLOB_MISS_COUNT=$(sudo grep -c "Pending blob sync for assignment" "$LOG_FILE")
-LIVENESS_COUNT=$(sudo grep -c "Data-Plane Liveness" "$LOG_FILE")
-DISCONNECT_COUNT=$(sudo grep -c "Peer disconnected" "$LOG_FILE")
+BLOB_MISS_COUNT=$(grep -c "Pending blob sync for assignment" "$LOG_FILE")
+LIVENESS_COUNT=$(grep -c "Data-Plane Liveness" "$LOG_FILE")
+DISCONNECT_COUNT=$(grep -c "Peer disconnected" "$LOG_FILE")
 
 if [ "$BLOB_MISS_COUNT" -gt 0 ]; then
     echo -e "\033[0;33m[!] CAUSE DETECTED:\033[0m Router skipped $BLOB_MISS_COUNT updates due to missing blobs."
