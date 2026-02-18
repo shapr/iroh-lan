@@ -89,7 +89,7 @@ export default function App() {
           if (state.peers === 0) {
             pushMessage("Looking for at least one peer to connect to…");
           } else {
-            pushMessage(`Found ${state.peers} peer${state.peers === 1 ? "" : "s"}`);
+            pushMessage(`Found ${state.peers} peer record${state.peers === 1 ? "" : "s"}`);
           }
         }
         if (state.raw_ip_state !== lastRawState) {
